@@ -1,0 +1,211 @@
+"""
+Train Qwen2-Audio on AfriSpeech ASR with WER-based reward.
+
+This script trains an audio model for Automatic Speech Recognition
+using GRPO (Group Relative Policy Optimization) with WER as the reward signal.
+
+Usage:
+    # Basic training
+    python train_afrispeech_asr.py \
+        --config_path configs/zero2.json \
+        --model_name_or_path Qwen/Qwen2-Audio-7B-Instruct \
+        --data_dir ./afrispeech_data \
+        --out_dir ./outputs/afrispeech_asr
+
+    # With specific accent
+    python train_afrispeech_asr.py \
+        --config_path configs/zero2.json \
+        --model_name_or_path Qwen/Qwen2-Audio-7B-Instruct \
+        --data_dir ./afrispeech_data \
+        --accent yoruba \
+        --out_dir ./outputs/afrispeech_asr_yoruba
+
+    # Load directly from HuggingFace
+    python train_afrispeech_asr.py \
+        --config_path configs/zero2.json \
+        --model_name_or_path Qwen/Qwen2-Audio-7B-Instruct \
+        --from_hf \
+        --out_dir ./outputs/afrispeech_asr
+"""
+
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+import transformers
+from transformers import HfArgumentParser
+from trl import GRPOConfig
+
+from trainer.grpo_trainer import GRPOTrainer
+from utils.rewards import wer_reward, format_reward
+from dataset.afrispeech_dataset import AfriSpeechASRDataset, AfriSpeechASRDatasetFromHF
+
+
+@dataclass
+class AfriSpeechTrainingArguments:
+    """Arguments for AfriSpeech ASR training."""
+
+    # Model arguments
+    model_name_or_path: str = field(
+        default="Qwen/Qwen2-Audio-7B-Instruct",
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"},
+    )
+
+    # Data arguments
+    data_dir: Optional[str] = field(
+        default="./afrispeech_data",
+        metadata={"help": "Directory containing downloaded AfriSpeech data"},
+    )
+    from_hf: bool = field(
+        default=False,
+        metadata={"help": "Load dataset directly from HuggingFace instead of local files"},
+    )
+    split: str = field(
+        default="train",
+        metadata={"help": "Dataset split to use (train, dev, test)"},
+    )
+    accent: Optional[str] = field(
+        default=None,
+        metadata={"help": "Filter for specific accent (e.g., yoruba, igbo)"},
+    )
+    max_duration: float = field(
+        default=30.0,
+        metadata={"help": "Maximum audio duration in seconds"},
+    )
+    min_duration: float = field(
+        default=0.5,
+        metadata={"help": "Minimum audio duration in seconds"},
+    )
+    num_examples: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of training examples to use (limits dataset size)"},
+    )
+
+    # Training arguments
+    config_path: str = field(
+        default="configs/zero2.json",
+        metadata={"help": "DeepSpeed config path"},
+    )
+    out_dir: str = field(
+        default="./outputs/afrispeech_asr",
+        metadata={"help": "Output directory for model checkpoints"},
+    )
+
+    # Reward arguments
+    use_format_reward: bool = field(
+        default=True,
+        metadata={"help": "Include format reward (checks for <answer> tags)"},
+    )
+
+    # WandB arguments
+    use_wandb: str = field(
+        default="false",
+        metadata={"help": "Whether to use wandb for logging (true/false)"},
+    )
+    run_name: str = field(
+        default="AfriSpeech-ASR-GRPO",
+        metadata={"help": "WandB run name"},
+    )
+
+    # Training hyperparameters
+    num_train_epochs: int = field(default=2, metadata={"help": "Number of training epochs"})
+    max_steps: int = field(default=-1, metadata={"help": "Maximum training steps (-1 for no limit)"})
+    per_device_train_batch_size: int = field(default=1, metadata={"help": "Batch size per device"})
+    gradient_accumulation_steps: int = field(default=2, metadata={"help": "Gradient accumulation steps"})
+    learning_rate: float = field(default=1e-6, metadata={"help": "Learning rate"})
+    num_generations: int = field(default=4, metadata={"help": "Number of generations per prompt for GRPO"})
+    temperature: float = field(default=1.0, metadata={"help": "Sampling temperature for generation"})
+    max_completion_length: int = field(default=256, metadata={"help": "Maximum completion length"})
+    save_steps: int = field(default=100, metadata={"help": "Save checkpoint every N steps"})
+
+    # Distributed training (set by launcher)
+    local_rank: int = field(default=-1, metadata={"help": "Local rank for distributed training"})
+
+
+def main():
+    parser = HfArgumentParser(AfriSpeechTrainingArguments)
+    args = parser.parse_args_into_dataclasses()[0]
+
+    # Setup logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    transformers.logging.set_verbosity_info()
+    logging.info(f"Training arguments: {args}")
+
+    # Setup reward functions
+    # WER reward: lower WER = higher reward (returns negative WER)
+    reward_funcs = [wer_reward]
+    if args.use_format_reward:
+        reward_funcs.append(format_reward)
+    logging.info(f"Using reward functions: {[f.__name__ for f in reward_funcs]}")
+
+    # Load dataset
+    if args.from_hf:
+        logging.info("Loading AfriSpeech from HuggingFace...")
+        train_dataset = AfriSpeechASRDatasetFromHF(
+            split=args.split,
+            max_duration=args.max_duration,
+            min_duration=args.min_duration,
+            accent_filter=args.accent,
+            num_examples=args.num_examples,
+        )
+    else:
+        logging.info(f"Loading AfriSpeech from local directory: {args.data_dir}")
+        train_dataset = AfriSpeechASRDataset(
+            data_dir=args.data_dir,
+            split=args.split,
+            max_duration=args.max_duration,
+            min_duration=args.min_duration,
+            accent_filter=args.accent,
+            num_examples=args.num_examples,
+        )
+
+    logging.info(f"Dataset size: {len(train_dataset)} samples")
+
+    # Setup training config
+    training_args = GRPOConfig(
+        seed=42,
+        data_seed=42,
+        output_dir=args.out_dir,
+        deepspeed=args.config_path,
+        max_prompt_length=512,
+        max_completion_length=args.max_completion_length,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        logging_steps=1,
+        bf16=True,
+        report_to="wandb" if args.use_wandb == "true" else [],
+        gradient_checkpointing=True,
+        num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,
+        run_name=args.run_name,
+        save_steps=args.save_steps,
+        save_only_model=True,
+        temperature=args.temperature,
+        num_generations=args.num_generations,
+    )
+
+    # Create trainer
+    trainer = GRPOTrainer(
+        model=args.model_name_or_path,
+        reward_funcs=reward_funcs,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=None,
+    )
+
+    # Train
+    logging.info("Starting training...")
+    trainer.train()
+
+    # Save final model
+    logging.info(f"Saving model to {args.out_dir}")
+    trainer.save_model(args.out_dir)
+    logging.info("Training complete!")
+
+
+if __name__ == "__main__":
+    main()
