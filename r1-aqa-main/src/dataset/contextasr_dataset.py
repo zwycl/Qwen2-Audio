@@ -30,7 +30,23 @@ CONTEXT_ASR_PROMPT_TEMPLATE = (
 
 # Fallback for samples without entities
 NO_CONTEXT_PROMPT_TEMPLATE = (
-    "Transcribe the following audio. Output the transcription in <answer> </answer>."
+    "You are a speech transcription system. Output ONLY the exact words spoken. "
+    "Output the transcription in <answer> </answer>."
+)
+
+# Two-step training: Refinement prompt templates (used for second pass)
+# The draft transcription from first pass is included to help refine
+REFINEMENT_PROMPT_TEMPLATE = (
+    "You are a speech transcription system. A previous transcription attempt produced: \"{draft_transcription}\". "
+    "Listen to the audio again and correct any errors. "
+    "The following names/terms may appear: {entity_str}. Use correct spelling for these terms. "
+    "Output the corrected transcription in <answer> </answer>."
+)
+
+REFINEMENT_NO_CONTEXT_PROMPT_TEMPLATE = (
+    "You are a speech transcription system. A previous transcription attempt produced: \"{draft_transcription}\". "
+    "Listen to the audio again and correct any errors. "
+    "Output the corrected transcription in <answer> </answer>."
 )
 
 
@@ -90,6 +106,7 @@ class ContextASRDataset(Dataset):
         max_audio_chunk: float = 30.0,  # Chunk long audio for model input
         num_examples: Optional[int] = None,
         include_no_context: bool = False,
+        no_entities: bool = False,
     ):
         """
         Initialize ContextASR dataset.
@@ -104,6 +121,7 @@ class ContextASRDataset(Dataset):
             max_audio_chunk: Maximum chunk size for model input (30s default)
             num_examples: Maximum number of examples to load (None for all)
             include_no_context: Include samples without entity list
+            no_entities: Do not add entities to prompt (use simple prompt)
         """
         super().__init__()
 
@@ -115,6 +133,7 @@ class ContextASRDataset(Dataset):
         self.min_duration = min_duration
         self.max_audio_chunk = max_audio_chunk
         self.include_no_context = include_no_context
+        self.no_entities = no_entities
 
         # Load metadata
         metadata_path = self.data_dir / config / language / "metadata.json"
@@ -286,9 +305,9 @@ class ContextASRDataset(Dataset):
                 if len(audio) < self.sample_rate * 0.1:  # Less than 0.1 second
                     raise ValueError(f"Audio chunk too short: {len(audio)} samples")
 
-                # Build prompt with entity context
+                # Build prompt (with or without entity context)
                 entity_list = sample["entity_list"]
-                if entity_list:
+                if entity_list and not self.no_entities:
                     entity_str = ", ".join(entity_list)
                     prompt_text = CONTEXT_ASR_PROMPT_TEMPLATE.format(entity_str=entity_str)
                 else:
@@ -342,6 +361,7 @@ class ContextASRDatasetFromHF(Dataset):
         max_audio_chunk: float = 30.0,  # Chunk long audio for model input
         num_examples: Optional[int] = None,
         include_no_context: bool = False,
+        no_entities: bool = False,
     ):
         """
         Initialize ContextASR dataset from HuggingFace.
@@ -355,6 +375,7 @@ class ContextASRDatasetFromHF(Dataset):
             max_audio_chunk: Maximum chunk size for model input
             num_examples: Maximum number of examples to load (None for all)
             include_no_context: Include samples without entity list
+            no_entities: Do not add entities to prompt (use simple prompt)
         """
         super().__init__()
         from datasets import load_dataset
@@ -364,6 +385,7 @@ class ContextASRDatasetFromHF(Dataset):
         self.language = language
         self.include_no_context = include_no_context
         self.max_audio_chunk = max_audio_chunk
+        self.no_entities = no_entities
 
         # Load dataset from HuggingFace
         logging.info(f"Loading ContextASR {config}/{language} from HuggingFace...")
@@ -489,9 +511,9 @@ class ContextASRDatasetFromHF(Dataset):
         # Audio is already preprocessed and chunked
         audio_array = sample["audio"]
 
-        # Build prompt with entity context
+        # Build prompt (with or without entity context)
         entity_list = sample["entity_list"]
-        if entity_list:
+        if entity_list and not self.no_entities:
             entity_str = ", ".join(entity_list)
             prompt_text = CONTEXT_ASR_PROMPT_TEMPLATE.format(entity_str=entity_str)
         else:

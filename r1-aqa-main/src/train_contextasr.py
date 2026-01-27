@@ -39,6 +39,27 @@ Usage:
         --model_name_or_path Qwen/Qwen2-Audio-7B-Instruct \
         --from_hf \
         --out_dir ./outputs/contextasr
+
+    # Use CGPR shaped reward (entity-aware dense rewards)
+    python train_contextasr.py \
+        --config_path configs/zero2.json \
+        --model_name_or_path Qwen/Qwen2-Audio-7B-Instruct \
+        --data_dir ./contextasr_data \
+        --use_cgpr_reward \
+        --cgpr_alpha 0.1 \
+        --cgpr_beta 0.2 \
+        --cgpr_lambda_entity 4.0 \
+        --out_dir ./outputs/contextasr_cgpr
+
+    # Two-step training (draft + refinement)
+    # Each step generates a draft transcription, then refines it using the draft
+    # as additional context. Trains on both passes with separate gradient updates.
+    python train_contextasr.py \
+        --config_path configs/zero2.json \
+        --model_name_or_path Qwen/Qwen2-Audio-7B-Instruct \
+        --data_dir ./contextasr_data \
+        --two_step_training \
+        --out_dir ./outputs/contextasr_twostep
 """
 
 import logging
@@ -50,7 +71,7 @@ from transformers import HfArgumentParser
 from trl import GRPOConfig
 
 from trainer.grpo_trainer import GRPOTrainer
-from utils.rewards import wer_reward, format_reward
+from utils.rewards import wer_reward, format_reward, cgpr_shaped_reward
 from dataset.contextasr_dataset import ContextASRDataset, ContextASRDatasetFromHF
 
 
@@ -101,6 +122,10 @@ class ContextASRTrainingArguments:
         default=False,
         metadata={"help": "Include samples without entity list for robustness"},
     )
+    no_entities: bool = field(
+        default=False,
+        metadata={"help": "Do not add entities to the prompt (for baseline comparison)"},
+    )
 
     # Training arguments
     config_path: str = field(
@@ -117,6 +142,30 @@ class ContextASRTrainingArguments:
         default=True,
         metadata={"help": "Include format reward (checks for <answer> tags)"},
     )
+    use_format_only_reward: bool = field(
+        default=False,
+        metadata={"help": "Use ONLY format reward (baseline - no ASR metrics)"},
+    )
+    use_cgpr_reward: bool = field(
+        default=False,
+        metadata={"help": "Use CGPR (Confidence-Gated Process Rewards) instead of simple WER reward"},
+    )
+    cgpr_alpha: float = field(
+        default=0.1,
+        metadata={"help": "CGPR: coefficient for correct entity reward"},
+    )
+    cgpr_beta: float = field(
+        default=0.2,
+        metadata={"help": "CGPR: coefficient for incorrect entity penalty"},
+    )
+    cgpr_lambda_entity: float = field(
+        default=4.0,
+        metadata={"help": "CGPR: weight for B-WER in terminal reward (only used if use_bwer=True)"},
+    )
+    cgpr_use_bwer: bool = field(
+        default=False,
+        metadata={"help": "CGPR: include B-WER in terminal reward (default False, redundant with dense rewards)"},
+    )
 
     # WandB arguments
     use_wandb: str = field(
@@ -126,6 +175,12 @@ class ContextASRTrainingArguments:
     run_name: str = field(
         default="ContextASR-GRPO",
         metadata={"help": "WandB run name"},
+    )
+
+    # Two-step training
+    two_step_training: bool = field(
+        default=False,
+        metadata={"help": "Enable two-step training: first generate draft, then refine using draft+context+audio"},
     )
 
     # Training hyperparameters
@@ -157,10 +212,36 @@ def main():
 
     # Setup reward functions
     # WER reward: lower WER = higher reward (returns negative WER)
-    reward_funcs = [wer_reward]
-    if args.use_format_reward:
-        reward_funcs.append(format_reward)
-    logging.info(f"Using reward functions: {[f.__name__ for f in reward_funcs]}")
+    # CGPR reward: adds dense token-level rewards for entity tokens weighted by confidence
+    # Format-only: baseline with no ASR metrics
+    if args.use_format_only_reward:
+        # Format-only baseline - no ASR reward
+        reward_funcs = [format_reward]
+        logging.info("Using FORMAT-ONLY reward (baseline - no ASR metrics)")
+    elif args.use_cgpr_reward:
+        # Wrapper to map entity_list from dataset to bias_list for CGPR
+        def cgpr_reward_wrapper(completions, solution, entity_list=None, **kwargs):
+            return cgpr_shaped_reward(
+                completions=completions,
+                solution=solution,
+                bias_list=entity_list,  # Map entity_list -> bias_list
+                alpha=args.cgpr_alpha,
+                beta=args.cgpr_beta,
+                lambda_entity=args.cgpr_lambda_entity,
+                use_bwer=args.cgpr_use_bwer,
+                **kwargs
+            )
+        cgpr_reward_wrapper.__name__ = "cgpr_shaped_reward"
+        reward_funcs = [cgpr_reward_wrapper]
+        logging.info(f"Using CGPR reward with alpha={args.cgpr_alpha}, beta={args.cgpr_beta}, lambda={args.cgpr_lambda_entity}, use_bwer={args.cgpr_use_bwer}")
+        if args.use_format_reward:
+            reward_funcs.append(format_reward)
+    else:
+        reward_funcs = [wer_reward]
+        if args.use_format_reward:
+            reward_funcs.append(format_reward)
+
+    logging.info(f"Using reward functions: {[getattr(f, '__name__', str(f)) for f in reward_funcs]}")
 
     # Load dataset
     if args.from_hf:
@@ -173,6 +254,7 @@ def main():
             max_audio_chunk=args.max_audio_chunk,
             num_examples=args.num_examples,
             include_no_context=args.include_no_context,
+            no_entities=args.no_entities,
         )
     else:
         logging.info(f"Loading ContextASR {args.dataset_config}/{args.language} from local directory: {args.data_dir}")
@@ -185,6 +267,7 @@ def main():
             max_audio_chunk=args.max_audio_chunk,
             num_examples=args.num_examples,
             include_no_context=args.include_no_context,
+            no_entities=args.no_entities,
         )
 
     logging.info(f"Dataset size: {len(train_dataset)} samples")
@@ -220,7 +303,11 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=None,
+        two_step_training=args.two_step_training,
     )
+
+    if args.two_step_training:
+        logging.info("Two-step training enabled: Pass 1 (draft) + Pass 2 (refinement) per step")
 
     # Train
     logging.info("Starting training...")

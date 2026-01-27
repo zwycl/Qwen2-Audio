@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import textwrap
 from collections import defaultdict
@@ -44,6 +45,9 @@ from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_f
 from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url, selective_log_softmax
 from trl.trainer.callbacks import SyncRefModelCallback
+
+from utils.rewards import cgpr_metrics
+from dataset.contextasr_dataset import REFINEMENT_PROMPT_TEMPLATE, REFINEMENT_NO_CONTEXT_PROMPT_TEMPLATE
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -154,6 +158,7 @@ class GRPOTrainer(Trainer):
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
         attn_implementation: str = "flash_attention_2",
+        two_step_training: bool = False,
     ):
         # Args
         if args is None:
@@ -260,7 +265,13 @@ class GRPOTrainer(Trainer):
         self.max_prompt_length = args.max_prompt_length
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
-        
+        self.two_step_training = two_step_training
+
+        # Two-step training: cache for gradient accumulation
+        if two_step_training:
+            self._two_step_cache = []  # List of (inputs, completions) tuples
+            self._accumulation_counter = 0
+
         self.beta = args.beta
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
@@ -289,10 +300,12 @@ class GRPOTrainer(Trainer):
 
         self.generation_config = GenerationConfig(
             max_new_tokens=self.max_completion_length,
-            do_sample=True,  
+            do_sample=True,
             temperature=args.temperature,
             num_return_sequences=self.num_generations,
             pad_token_id=processing_class.pad_token_id,
+            eos_token_id=processing_class.eos_token_id,
+            renormalize_logits=True,  # Prevent NaN/Inf in sampling
         )
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
@@ -322,12 +335,18 @@ class GRPOTrainer(Trainer):
             self._signature_columns = ["prompt"]
     
     # Get the per-token log probabilities for the completions for the model and the reference model
-    def _get_per_token_logps(self, model, input_ids, attention_mask, features_values, features_masks):
+    def _get_per_token_logps(self, model, input_ids, attention_mask, features_values, features_masks, return_topk=False, topk=10):
         logits = model(input_ids, attention_mask=attention_mask, input_features=features_values, feature_attention_mask=features_masks).logits  # (B, L, V)
         logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
         input_ids = input_ids[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it
         # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
-        return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
+        per_token_logps = selective_log_softmax(logits, input_ids)
+
+        if return_topk:
+            # Extract top-k logits for entropy-based confidence computation
+            topk_logits, _ = torch.topk(logits, k=topk, dim=-1)  # (B, L-1, k)
+            return per_token_logps, topk_logits
+        return per_token_logps
 
 
     # Trainer "prepares" the inputs before calling `compute_loss`. It converts to tensor and move to device.
@@ -335,10 +354,109 @@ class GRPOTrainer(Trainer):
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         return inputs
 
+    def _extract_draft_transcription(self, completion_text: str) -> str:
+        """Extract the transcription from completion text, handling <answer> tags."""
+        import re
+        # Try to extract content from <answer> tags
+        match = re.search(r"<answer>(.*?)</answer>", completion_text, re.DOTALL)
+        if match:
+            draft = match.group(1).strip()
+        else:
+            # Fallback: use the whole completion
+            draft = completion_text.strip()
+
+        # Defensive: ensure non-empty and reasonable length
+        if not draft:
+            draft = "[empty transcription]"
+        # Truncate very long drafts to avoid tokenization issues
+        if len(draft) > 2000:
+            draft = draft[:2000]
+        return draft
+
+    def _build_refinement_prompts(self, inputs: list, best_completions: list) -> list:
+        """
+        Build refinement prompts for the second pass of two-step training.
+
+        Args:
+            inputs: Original input samples (batch)
+            best_completions: Best draft completion per sample (one per sample)
+
+        Returns:
+            List of refinement prompts, one per sample
+        """
+        refinement_prompts = []
+
+        for i, inp in enumerate(inputs):
+            entity_list = inp.get("entity_list", [])
+            audio_path = ""
+            # Extract audio_url from original prompt
+            for msg in inp.get("prompt", []):
+                if msg.get("role") == "user":
+                    for content_item in msg.get("content", []):
+                        if content_item.get("type") == "audio":
+                            audio_path = content_item.get("audio_url", "")
+                            break
+
+            # Get best draft for this sample
+            draft_completion = best_completions[i]
+
+            # Extract draft text from completion
+            if isinstance(draft_completion, list):
+                draft_text = draft_completion[0]["content"]
+            else:
+                draft_text = draft_completion
+            draft_transcription = self._extract_draft_transcription(draft_text)
+
+            # Build refinement prompt text
+            if entity_list:
+                entity_str = ", ".join(entity_list)
+                prompt_text = REFINEMENT_PROMPT_TEMPLATE.format(
+                    draft_transcription=draft_transcription,
+                    entity_str=entity_str
+                )
+            else:
+                prompt_text = REFINEMENT_NO_CONTEXT_PROMPT_TEMPLATE.format(
+                    draft_transcription=draft_transcription
+                )
+
+            # Build prompt in the same format as original
+            refinement_prompt = {
+                "prompt": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "audio", "audio_url": audio_path},
+                            {"type": "text", "text": prompt_text},
+                        ],
+                    }
+                ],
+                "audio": inp.get("audio"),
+                "solution": inp.get("solution"),
+                "entity_list": entity_list,
+                # Preserve other metadata
+                "language": inp.get("language"),
+                "dataset_name": inp.get("dataset_name"),
+                "uniq_id": inp.get("uniq_id"),
+                "chunk_start": inp.get("chunk_start"),
+                "chunk_end": inp.get("chunk_end"),
+            }
+            refinement_prompts.append(refinement_prompt)
+
+        return refinement_prompts
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
-     
+
+        try:
+            return self._compute_loss_inner(model, inputs, num_items_in_batch)
+        except Exception as e:
+            logging.warning(f"Compute loss failed, skipping batch: {e}")
+            # Return zero loss to skip this batch
+            device = self.accelerator.device
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+    def _compute_loss_inner(self, model, inputs, num_items_in_batch=None):
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
         audios = [x["audio"] for x in inputs]
@@ -374,9 +492,12 @@ class GRPOTrainer(Trainer):
         model_device = next(unwrapped_model.parameters()).device
         generation_inputs = {k: v.to(model_device) if isinstance(v, torch.Tensor) else v for k, v in prompt_inputs.items()}
 
+        # Check for NaN/Inf in input features before generation
+        if torch.isnan(generation_inputs["input_features"]).any() or torch.isinf(generation_inputs["input_features"]).any():
+            raise ValueError("NaN/Inf detected in input features, skipping batch")
+
         with torch.no_grad():
             prompt_completion_ids = unwrapped_model.generate(**generation_inputs, generation_config=self.generation_config)
-            # Move output back to accelerator device
             prompt_completion_ids = prompt_completion_ids.to(self.accelerator.device)
 
         # Re-enable gradient checkpointing if it was enabled
@@ -415,9 +536,10 @@ class GRPOTrainer(Trainer):
         features_values = features_values.repeat(self.num_generations, 1, 1)
         features_masks = features_masks.repeat_interleave(self.num_generations, dim=0)
 
-        per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, features_values, features_masks)
+        per_token_logps, topk_logits = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, features_values, features_masks, return_topk=True, topk=10)
         # Get rid of the prompt (-1 because of the shift done in get_per_token_logps)
         per_token_logps = per_token_logps[:, prompt_length - 1 :]
+        topk_logits = topk_logits[:, prompt_length - 1 :]  # (B*G, completion_length, 10)
 
         with torch.inference_mode():
             if self.ref_model is not None:
@@ -444,7 +566,7 @@ class GRPOTrainer(Trainer):
             print(f"  completion_ids shape: {completion_ids.shape}")
             print("="*80)
 
-            for i, inp in enumerate(inputs[:2]):  # Show first 2 chunks
+            for i, inp in enumerate(inputs):  # Show all chunks in batch
                 # Chunk metadata
                 chunk_id = inp.get("uniq_id", f"chunk_{i}")
                 chunk_start = inp.get("chunk_start", 0)
@@ -452,34 +574,34 @@ class GRPOTrainer(Trainer):
                 audio = inp.get("audio")
                 audio_duration = len(audio) / 16000 if audio is not None else 0
                 solution = inp.get("solution", "N/A")
-                lang = inp.get("language", "en")
-                dataset_name = inp.get("dataset_name", "unknown")
+                entity_list = inp.get("entity_list", [])
+
+                # Extract prompt text
+                prompt = inp.get("prompt", [])
+                prompt_text = ""
+                for msg in prompt:
+                    if msg.get("role") == "user":
+                        for content_item in msg.get("content", []):
+                            if content_item.get("type") == "text":
+                                prompt_text = content_item.get("text", "")
+                                break
 
                 # Extract ground truth from solution
                 sol_match = re.search(r"<answer>(.*?)</answer>", str(solution), re.DOTALL)
                 ref = sol_match.group(1).strip() if sol_match else str(solution).strip()
 
-                # Estimate: ~150 words/min = 2.5 words/sec, ~6 chars/word = ~15 chars/sec
-                expected_chars = int(audio_duration * 15)
-                chars_per_sec = len(ref) / audio_duration if audio_duration > 0 else 0
+                print(f"\n[Chunk {i+1}/{len(inputs)}] ID: {chunk_id} ({chunk_start:.1f}s - {chunk_end:.1f}s)")
+                print(f"  Entities: {entity_list}")
+                print(f"  Prompt: {prompt_text}")
+                print(f"  Ref: {ref}")
 
-                print(f"\n[Chunk {i+1}] ID: {chunk_id}")
-                print(f"  Dataset: {dataset_name} | Language: {lang}")
-                print(f"  Chunk timing: {chunk_start:.2f}s - {chunk_end:.2f}s (duration: {audio_duration:.2f}s)")
-                print(f"  Ground Truth ({len(ref)} chars, {chars_per_sec:.1f} chars/sec, expected ~{expected_chars} chars):")
-                print(f"    {ref}")
-
-                # Show generations for this chunk (num_generations outputs per chunk)
-                gen_start = i * self.num_generations
-                gen_end = gen_start + self.num_generations
-                chunk_completions = completions[gen_start:gen_end]
-
-                for g, comp in enumerate(chunk_completions[:2]):  # Show first 2 generations
-                    content = comp[0]["content"] if isinstance(comp, list) else comp
-                    content_match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL)
-                    pred = content_match.group(1).strip() if content_match else content.strip()
-                    print(f"  Gen {g+1} ({len(pred)} chars):")
-                    print(f"    {pred}")
+                # Show first generation only for this chunk
+                gen_idx = i * self.num_generations
+                comp = completions[gen_idx]
+                content = comp[0]["content"] if isinstance(comp, list) else comp
+                content_match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL)
+                pred = content_match.group(1).strip() if content_match else content.strip()
+                print(f"  Gen: {pred}")
 
             print("="*80 + "\n")
 
@@ -509,6 +631,14 @@ class GRPOTrainer(Trainer):
                     for example in inputs:
                         # Repeat each value in the column for `num_generations` times
                         reward_kwargs[key].extend([example[key]] * self.num_generations)
+
+                # Pass top-k logits for CGPR dense reward Tsallis entropy confidence
+                # topk_logits shape: (batch*G, completion_length, 10)
+                reward_kwargs["topk_logits_list"] = topk_logits.cpu().tolist()
+                reward_kwargs["token_ids_list"] = completion_ids.cpu().tolist()
+                # Pass tokenizer for entity word tokenization
+                reward_kwargs["tokenizer"] = self.processing_class.tokenizer if hasattr(self.processing_class, 'tokenizer') else self.processing_class
+
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
@@ -528,6 +658,18 @@ class GRPOTrainer(Trainer):
         per_token_loss = -(per_token_logps * advantages.unsqueeze(1)) + self.beta * per_token_kl
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
+        # Cache best completions for two-step training (accumulate across gradient accumulation steps)
+        if self.two_step_training:
+            # Pick best draft per sample based on reward
+            best_completions = []
+            for i in range(len(inputs)):
+                start_idx = i * self.num_generations
+                end_idx = start_idx + self.num_generations
+                sample_rewards = rewards[start_idx:end_idx]
+                best_idx = sample_rewards.argmax().item()
+                best_completions.append(completions[start_idx + best_idx])
+            self._two_step_cache.append((inputs, best_completions))
+
         # Log the metrics
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics["completion_length"].append(completion_length)
@@ -540,6 +682,12 @@ class GRPOTrainer(Trainer):
                 reward_func_name = reward_func.__name__
             self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
 
+        # Log CGPR component metrics if available
+        if len(cgpr_metrics["cer"]) > 0:
+            self._metrics["cgpr/cer"].append(sum(cgpr_metrics["cer"]) / len(cgpr_metrics["cer"]))
+            self._metrics["cgpr/bwer"].append(sum(cgpr_metrics["bwer"]) / len(cgpr_metrics["bwer"]))
+            self._metrics["cgpr/dense_reward"].append(sum(cgpr_metrics["dense_reward"]) / len(cgpr_metrics["dense_reward"]))
+
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
         self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
 
@@ -547,6 +695,283 @@ class GRPOTrainer(Trainer):
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
         return loss
+
+    def compute_refinement_loss(self, model, inputs, completions):
+        """
+        Compute loss for the refinement pass (second pass of two-step training).
+
+        Args:
+            model: The model to compute loss for
+            inputs: Original input samples
+            completions: Draft completions from first pass
+        """
+        try:
+            return self._compute_refinement_loss_inner(model, inputs, completions)
+        except Exception as e:
+            logging.warning(f"Refinement pass failed, skipping batch: {e}")
+            # Return zero loss to skip this batch
+            device = self.accelerator.device
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+    def _compute_refinement_loss_inner(self, model, inputs, completions):
+        """Inner implementation of refinement loss computation."""
+        import re
+
+        # Build refinement prompts using draft completions
+        refinement_inputs = self._build_refinement_prompts(inputs, completions)
+
+        # Process refinement prompts (one per draft, so batch*G items)
+        ref_prompts = [x["prompt"] for x in refinement_inputs]
+        ref_prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in refinement_inputs]
+        ref_audios = [x["audio"] for x in refinement_inputs]
+
+        ref_prompt_inputs = self.processing_class(
+            text=ref_prompts_text,
+            audio=ref_audios,
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True
+        )
+        ref_prompt_inputs = super()._prepare_inputs(ref_prompt_inputs)
+
+        ref_features_values = ref_prompt_inputs["input_features"]
+        ref_features_masks = ref_prompt_inputs["feature_attention_mask"]
+
+        # Get model for generation
+        if hasattr(model, 'module'):
+            unwrapped_model = model.module
+        else:
+            unwrapped_model = self.accelerator.unwrap_model(model)
+
+        is_gradient_checkpointing = getattr(unwrapped_model, 'is_gradient_checkpointing', False)
+        model_device = next(unwrapped_model.parameters()).device
+        device = self.accelerator.device
+
+        # Generate refinement completions (num_generations per sample, using best draft)
+        ref_generation_inputs = {k: v.to(model_device) if isinstance(v, torch.Tensor) else v for k, v in ref_prompt_inputs.items()}
+
+        ref_generation_config = GenerationConfig(
+            max_new_tokens=self.max_completion_length,
+            do_sample=True,
+            temperature=self.generation_config.temperature,
+            num_return_sequences=self.num_generations,  # Generate G refinements per best draft
+            pad_token_id=self.processing_class.pad_token_id,
+            eos_token_id=self.processing_class.eos_token_id,
+            renormalize_logits=True,  # Prevent NaN/Inf in sampling
+        )
+
+        if is_gradient_checkpointing:
+            unwrapped_model.gradient_checkpointing_disable()
+
+        # Check for NaN/Inf in input features before generation
+        if torch.isnan(ref_generation_inputs["input_features"]).any() or torch.isinf(ref_generation_inputs["input_features"]).any():
+            raise ValueError("NaN/Inf detected in input features, skipping batch")
+
+        with torch.no_grad():
+            ref_prompt_completion_ids = unwrapped_model.generate(**ref_generation_inputs, generation_config=ref_generation_config)
+            ref_prompt_completion_ids = ref_prompt_completion_ids.to(device)
+
+        if is_gradient_checkpointing:
+            unwrapped_model.gradient_checkpointing_enable()
+
+        ref_prompt_length = ref_prompt_inputs["input_ids"].size(1)
+        ref_completion_ids = ref_prompt_completion_ids[:, ref_prompt_length:]
+
+        # Mask everything after the first EOS token
+        ref_is_eos = ref_completion_ids == self.processing_class.eos_token_id
+        ref_eos_idx = torch.full((ref_is_eos.size(0),), ref_is_eos.size(1), dtype=torch.long, device=device)
+        ref_eos_idx[ref_is_eos.any(dim=1)] = ref_is_eos.int().argmax(dim=1)[ref_is_eos.any(dim=1)]
+        ref_sequence_indices = torch.arange(ref_is_eos.size(1), device=device).expand(ref_is_eos.size(0), -1)
+        ref_completion_mask = (ref_sequence_indices <= ref_eos_idx.unsqueeze(1)).int()
+
+        # Create attention mask (expand for num_generations)
+        ref_prompt_mask = ref_prompt_inputs["attention_mask"].repeat_interleave(self.num_generations, dim=0)
+        ref_attention_mask = torch.cat([ref_prompt_mask, ref_completion_mask], dim=1)
+
+        # Expand features for num_generations
+        ref_features_values = ref_features_values.repeat(self.num_generations, 1, 1)
+        ref_features_masks = ref_features_masks.repeat_interleave(self.num_generations, dim=0)
+
+        # Compute log probs for refinement pass
+        ref_per_token_logps, ref_topk_logits = self._get_per_token_logps(
+            model, ref_prompt_completion_ids, ref_attention_mask,
+            ref_features_values, ref_features_masks, return_topk=True, topk=10
+        )
+        ref_per_token_logps = ref_per_token_logps[:, ref_prompt_length - 1 :]
+        ref_topk_logits = ref_topk_logits[:, ref_prompt_length - 1 :]
+
+        with torch.inference_mode():
+            if self.ref_model is not None:
+                ref_ref_per_token_logps = self._get_per_token_logps(
+                    self.ref_model, ref_prompt_completion_ids, ref_attention_mask,
+                    ref_features_values, ref_features_masks
+                )
+            else:
+                with self.accelerator.unwrap_model(model).disable_adapter():
+                    ref_ref_per_token_logps = self._get_per_token_logps(
+                        model, ref_prompt_completion_ids, ref_attention_mask,
+                        ref_features_values, ref_features_masks
+                    )
+        ref_ref_per_token_logps = ref_ref_per_token_logps[:, ref_prompt_length - 1 :]
+
+        # Compute KL
+        ref_per_token_kl = torch.exp(ref_ref_per_token_logps - ref_per_token_logps) - (ref_ref_per_token_logps - ref_per_token_logps) - 1
+
+        # Decode refinement completions
+        ref_completions = self.processing_class.batch_decode(ref_completion_ids, skip_special_tokens=True)
+        if is_conversational(inputs[0]):
+            ref_completions = [[{"role": "assistant", "content": completion}] for completion in ref_completions]
+
+        # Debug logging
+        if self.accelerator.is_main_process and self.state.global_step % 2 == 0:
+            print("\n" + "="*80)
+            print(f"DEBUG: Step {self.state.global_step} - Refinement Pass (Pass 2)")
+            print("="*80)
+            for i in range(min(2, len(inputs))):
+                # Best draft from pass 1 (one per sample)
+                draft_comp = completions[i]
+                draft_text = draft_comp[0]["content"] if isinstance(draft_comp, list) else draft_comp
+                draft_match = re.search(r"<answer>(.*?)</answer>", draft_text, re.DOTALL)
+                draft_pred = draft_match.group(1).strip() if draft_match else draft_text.strip()
+
+                # First refined output from pass 2
+                ref_idx = i * self.num_generations
+                ref_comp = ref_completions[ref_idx]
+                ref_text = ref_comp[0]["content"] if isinstance(ref_comp, list) else ref_comp
+                ref_match = re.search(r"<answer>(.*?)</answer>", ref_text, re.DOTALL)
+                ref_pred = ref_match.group(1).strip() if ref_match else ref_text.strip()
+
+                # Ground truth
+                solution = inputs[i].get("solution", "")
+                sol_match = re.search(r"<answer>(.*?)</answer>", str(solution), re.DOTALL)
+                ground_truth = sol_match.group(1).strip() if sol_match else str(solution).strip()
+
+                print(f"\n[Sample {i+1}]")
+                print(f"  Ground Truth: {ground_truth}")
+                print(f"  Best Draft (Pass 1): {draft_pred}")
+                print(f"  Refined (Pass 2): {ref_pred}")
+            print("="*80 + "\n")
+
+        # Compute rewards for refinement pass
+        # Expand prompts to match completions (num_generations per sample)
+        ref_prompts_expanded = [p for p in ref_prompts for _ in range(self.num_generations)]
+        num_total_completions = len(inputs) * self.num_generations
+
+        ref_rewards_per_func = torch.zeros(num_total_completions, len(self.reward_funcs), device=device)
+        for i, (reward_func, reward_processing_class) in enumerate(
+            zip(self.reward_funcs, self.reward_processing_classes)
+        ):
+            if isinstance(reward_func, PreTrainedModel):
+                if is_conversational(inputs[0]):
+                    messages = [{"messages": p + c} for p, c in zip(ref_prompts_expanded, ref_completions)]
+                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                else:
+                    texts = [p + c for p, c in zip(ref_prompts_expanded, ref_completions)]
+                reward_inputs = reward_processing_class(
+                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                )
+                reward_inputs = super()._prepare_inputs(reward_inputs)
+                with torch.inference_mode():
+                    ref_rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]
+            else:
+                # Expand reward kwargs for num_generations
+                reward_kwargs = {key: [] for key in refinement_inputs[0].keys() if key not in ["prompt", "completion"]}
+                for key in reward_kwargs:
+                    for example in refinement_inputs:
+                        reward_kwargs[key].extend([example[key]] * self.num_generations)
+
+                reward_kwargs["topk_logits_list"] = ref_topk_logits.cpu().tolist()
+                reward_kwargs["token_ids_list"] = ref_completion_ids.cpu().tolist()
+                reward_kwargs["tokenizer"] = self.processing_class.tokenizer if hasattr(self.processing_class, 'tokenizer') else self.processing_class
+
+                output_reward_func = reward_func(prompts=ref_prompts_expanded, completions=ref_completions, **reward_kwargs)
+                ref_rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        ref_rewards = ref_rewards_per_func.sum(dim=1)
+
+        # Compute advantages (group by original sample, num_generations per sample)
+        ref_mean_grouped_rewards = ref_rewards.view(-1, self.num_generations).mean(dim=1)
+        ref_std_grouped_rewards = ref_rewards.view(-1, self.num_generations).std(dim=1)
+        ref_mean_grouped_rewards = ref_mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        ref_std_grouped_rewards = ref_std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        ref_advantages = (ref_rewards - ref_mean_grouped_rewards) / (ref_std_grouped_rewards + 1e-4)
+
+        # Compute refinement loss
+        ref_per_token_loss = -(ref_per_token_logps * ref_advantages.unsqueeze(1)) + self.beta * ref_per_token_kl
+        loss = ((ref_per_token_loss * ref_completion_mask).sum(dim=1) / ref_completion_mask.sum(dim=1)).mean()
+
+        # Log refinement metrics
+        ref_completion_length = self.accelerator.gather_for_metrics(ref_completion_mask.sum(1)).float().mean().item()
+        self._metrics["refinement_completion_length"].append(ref_completion_length)
+        self._metrics["refinement_reward"].append(self.accelerator.gather_for_metrics(ref_rewards).mean().item())
+
+        ref_mean_kl = ((ref_per_token_kl * ref_completion_mask).sum(dim=1) / ref_completion_mask.sum(dim=1)).mean()
+        self._metrics["refinement_kl"].append(self.accelerator.gather_for_metrics(ref_mean_kl).mean().item())
+
+        return loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """
+        Override training_step to support two-step training with proper gradient accumulation.
+
+        For two-step training:
+        - Accumulate Pass 1 gradients over gradient_accumulation_steps
+        - Step optimizer for Pass 1, update model
+        - Run Pass 2 for all cached batches (with updated model)
+        - Accumulate Pass 2 gradients
+        - Step optimizer for Pass 2 (handled by outer loop)
+        """
+        model.train()
+
+        # First pass: compute loss, backward, cache completions
+        loss_pass1 = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
+
+        if self.args.gradient_accumulation_steps > 1:
+            loss_pass1 = loss_pass1 / self.args.gradient_accumulation_steps
+
+        # Backward pass 1
+        self.accelerator.backward(loss_pass1)
+
+        if not self.two_step_training:
+            return loss_pass1.detach()
+
+        # Two-step training: track accumulation
+        self._accumulation_counter += 1
+        self._metrics["loss_pass1"].append(loss_pass1.item() * self.args.gradient_accumulation_steps)
+
+        # Check if we've accumulated enough steps
+        if self._accumulation_counter < self.args.gradient_accumulation_steps:
+            # Not ready for pass 2 yet, return pass 1 loss
+            # Return 0 so outer loop doesn't step yet (we handle it ourselves)
+            return loss_pass1.detach()
+
+        # Accumulation complete for pass 1 - step optimizer
+        if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
+            self.accelerator.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+
+        self.optimizer.step()
+        # Note: Don't step lr_scheduler here - outer loop will step it once per training step
+        self.optimizer.zero_grad()
+
+        # Now run Pass 2 for all cached batches with the updated model
+        total_loss_pass2 = 0.0
+        for cached_inputs, cached_completions in self._two_step_cache:
+            loss_pass2 = self.compute_refinement_loss(model, cached_inputs, cached_completions)
+
+            if self.args.gradient_accumulation_steps > 1:
+                loss_pass2 = loss_pass2 / self.args.gradient_accumulation_steps
+
+            self.accelerator.backward(loss_pass2)
+            total_loss_pass2 += loss_pass2.item()
+
+        self._metrics["loss_pass2"].append(total_loss_pass2)
+
+        # Clear cache and reset counter
+        self._two_step_cache = []
+        self._accumulation_counter = 0
+
+        # Return pass 2 loss - outer loop will handle optimizer step for pass 2
+        return torch.tensor(total_loss_pass2, device=self.accelerator.device)
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics
