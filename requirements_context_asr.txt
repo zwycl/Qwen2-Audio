@@ -1,9 +1,0 @@
-# Requirements for context_asr_gradio.py and download_contextasr.py
-gradio>=4.31.0
-datasets
-transformers
-torch
-librosa
-numpy
-soundfile
-huggingface_hub

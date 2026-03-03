@@ -46,8 +46,8 @@ from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url, selective_log_softmax
 from trl.trainer.callbacks import SyncRefModelCallback
 
-from utils.rewards import cgpr_metrics
-from dataset.contextasr_dataset import REFINEMENT_PROMPT_TEMPLATE, REFINEMENT_NO_CONTEXT_PROMPT_TEMPLATE
+from utils.rewards import cgpr_metrics, cgpr_plus_metrics
+from dataset import REFINEMENT_PROMPT_TEMPLATE, REFINEMENT_NO_CONTEXT_PROMPT_TEMPLATE
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -449,12 +449,24 @@ class GRPOTrainer(Trainer):
             raise ValueError("The GRPOTrainer does not support returning outputs")
 
         try:
-            return self._compute_loss_inner(model, inputs, num_items_in_batch)
+            loss = self._compute_loss_inner(model, inputs, num_items_in_batch)
         except Exception as e:
             logging.warning(f"Compute loss failed, skipping batch: {e}")
             # Return zero loss to skip this batch
             device = self.accelerator.device
-            return torch.tensor(0.0, device=device, requires_grad=True)
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+        # Ensure loss is a scalar tensor (required by DeepSpeed)
+        if not isinstance(loss, torch.Tensor):
+            device = self.accelerator.device
+            loss = torch.tensor(float(loss), device=device, requires_grad=True)
+        if loss.dim() != 0:
+            loss = loss.mean()  # Force to scalar
+        if not loss.requires_grad:
+            # Wrap in a computation that requires grad
+            zero = torch.zeros(1, device=loss.device, requires_grad=True).sum()
+            loss = loss + zero
+        return loss
 
     def _compute_loss_inner(self, model, inputs, num_items_in_batch=None):
         prompts = [x["prompt"] for x in inputs]
@@ -656,7 +668,12 @@ class GRPOTrainer(Trainer):
 
         # Standard policy gradient: -log_prob * advantage + KL penalty
         per_token_loss = -(per_token_logps * advantages.unsqueeze(1)) + self.beta * per_token_kl
-        loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        # Avoid division by zero for empty completions
+        completion_lengths = completion_mask.sum(dim=1).clamp(min=1)
+        loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_lengths).mean()
+        # Handle NaN/Inf by replacing with zero (keep requires_grad from original)
+        if torch.isnan(loss) or torch.isinf(loss):
+            loss = loss * 0.0  # Preserves requires_grad and device
 
         # Cache best completions for two-step training (accumulate across gradient accumulation steps)
         if self.two_step_training:
@@ -688,10 +705,15 @@ class GRPOTrainer(Trainer):
             self._metrics["cgpr/bwer"].append(sum(cgpr_metrics["bwer"]) / len(cgpr_metrics["bwer"]))
             self._metrics["cgpr/dense_reward"].append(sum(cgpr_metrics["dense_reward"]) / len(cgpr_metrics["dense_reward"]))
 
+        # Log CGPR+ component metrics if available
+        if len(cgpr_plus_metrics["cer"]) > 0:
+            self._metrics["cgpr_plus/cer"].append(sum(cgpr_plus_metrics["cer"]) / len(cgpr_plus_metrics["cer"]))
+            self._metrics["cgpr_plus/script_fidelity"].append(sum(cgpr_plus_metrics["script_fidelity"]) / len(cgpr_plus_metrics["script_fidelity"]))
+
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
         self._metrics["reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
 
-        mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_lengths).mean()
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
         return loss
@@ -706,12 +728,24 @@ class GRPOTrainer(Trainer):
             completions: Draft completions from first pass
         """
         try:
-            return self._compute_refinement_loss_inner(model, inputs, completions)
+            loss = self._compute_refinement_loss_inner(model, inputs, completions)
         except Exception as e:
             logging.warning(f"Refinement pass failed, skipping batch: {e}")
             # Return zero loss to skip this batch
             device = self.accelerator.device
-            return torch.tensor(0.0, device=device, requires_grad=True)
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+        # Ensure loss is a scalar tensor (required by DeepSpeed)
+        if not isinstance(loss, torch.Tensor):
+            device = self.accelerator.device
+            loss = torch.tensor(float(loss), device=device, requires_grad=True)
+        if loss.dim() != 0:
+            loss = loss.mean()  # Force to scalar
+        if not loss.requires_grad:
+            # Wrap in a computation that requires grad
+            zero = torch.zeros(1, device=loss.device, requires_grad=True).sum()
+            loss = loss + zero
+        return loss
 
     def _compute_refinement_loss_inner(self, model, inputs, completions):
         """Inner implementation of refinement loss computation."""
@@ -898,14 +932,19 @@ class GRPOTrainer(Trainer):
 
         # Compute refinement loss
         ref_per_token_loss = -(ref_per_token_logps * ref_advantages.unsqueeze(1)) + self.beta * ref_per_token_kl
-        loss = ((ref_per_token_loss * ref_completion_mask).sum(dim=1) / ref_completion_mask.sum(dim=1)).mean()
+        # Avoid division by zero for empty completions
+        ref_completion_lengths = ref_completion_mask.sum(dim=1).clamp(min=1)
+        loss = ((ref_per_token_loss * ref_completion_mask).sum(dim=1) / ref_completion_lengths).mean()
+        # Handle NaN/Inf by replacing with zero (preserve requires_grad)
+        if torch.isnan(loss) or torch.isinf(loss):
+            loss = loss * 0.0
 
         # Log refinement metrics
         ref_completion_length = self.accelerator.gather_for_metrics(ref_completion_mask.sum(1)).float().mean().item()
         self._metrics["refinement_completion_length"].append(ref_completion_length)
         self._metrics["refinement_reward"].append(self.accelerator.gather_for_metrics(ref_rewards).mean().item())
 
-        ref_mean_kl = ((ref_per_token_kl * ref_completion_mask).sum(dim=1) / ref_completion_mask.sum(dim=1)).mean()
+        ref_mean_kl = ((ref_per_token_kl * ref_completion_mask).sum(dim=1) / ref_completion_lengths).mean()
         self._metrics["refinement_kl"].append(self.accelerator.gather_for_metrics(ref_mean_kl).mean().item())
 
         return loss
@@ -972,6 +1011,133 @@ class GRPOTrainer(Trainer):
 
         # Return pass 2 loss - outer loop will handle optimizer step for pass 2
         return torch.tensor(total_loss_pass2, device=self.accelerator.device)
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        """Evaluate CER and bCER on the validation set during training."""
+        import numpy as np
+        from tqdm import tqdm
+
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if eval_dataset is None:
+            return {}
+
+        model = self.model
+        if hasattr(model, 'module'):
+            unwrapped_model = model.module
+        else:
+            unwrapped_model = self.accelerator.unwrap_model(model)
+
+        was_training = unwrapped_model.training
+        unwrapped_model.eval()
+
+        is_gc = getattr(unwrapped_model, 'is_gradient_checkpointing', False)
+        if is_gc:
+            unwrapped_model.gradient_checkpointing_disable()
+
+        from evaluate_csfleurs import compute_cer, compute_bcer, extract_answer
+        from utils.rewards import _remove_sp
+
+        metrics = {}
+
+        if self.accelerator.is_main_process:
+            model_device = next(unwrapped_model.parameters()).device
+            num_eval = len(eval_dataset)
+            cer_values = []
+            bcer_values = []
+
+            print(f"\n{'='*60}")
+            print(f"Validation at step {self.state.global_step} ({num_eval} samples)")
+            print(f"{'='*60}")
+
+            for idx in tqdm(range(num_eval), desc="Eval"):
+                sample = eval_dataset[idx]
+
+                prompt = sample["prompt"]
+                example = {"prompt": prompt}
+                prompt_text = maybe_apply_chat_template(example, self.processing_class)["prompt"]
+
+                audio = sample["audio"]
+                if isinstance(audio, np.ndarray):
+                    audio = audio.astype(np.float32)
+
+                try:
+                    inputs = self.processing_class(
+                        text=[prompt_text],
+                        audio=[audio],
+                        sampling_rate=16000,
+                        return_tensors="pt",
+                        padding=True,
+                    )
+                    inputs = {k: v.to(model_device) if isinstance(v, torch.Tensor) else v
+                              for k, v in inputs.items()}
+
+                    with torch.no_grad():
+                        outputs = unwrapped_model.generate(
+                            **inputs,
+                            max_new_tokens=self.max_completion_length,
+                            do_sample=False,
+                        )
+
+                    generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
+                    transcription = self.processing_class.decode(
+                        generated_ids, skip_special_tokens=True
+                    )
+                except Exception as e:
+                    logging.warning(f"Eval sample {idx} failed: {e}")
+                    continue
+
+                pred = extract_answer(transcription)
+                solution = sample.get("solution", "")
+                ref = extract_answer(solution)
+
+                language = sample.get("language", "")
+                lang = "zh" if language and (
+                    "cmn" in language.lower() or "zho" in language.lower()
+                ) else "en"
+
+                pred_norm = _remove_sp(pred, lang)
+                ref_norm = _remove_sp(ref, lang)
+
+                cer = compute_cer(ref_norm, pred_norm)
+                cer_values.append(cer)
+
+                raw_text = sample.get("raw_text", "")
+                bcer_result = compute_bcer(raw_text, pred_norm, k=15)
+                if bcer_result["bcer"] is not None and bcer_result["boundary_chars"] > 0:
+                    bcer_values.append(bcer_result["bcer"])
+
+            avg_cer = sum(cer_values) / len(cer_values) if cer_values else 0.0
+            avg_bcer = sum(bcer_values) / len(bcer_values) if bcer_values else None
+
+            print(f"  Eval CER:  {avg_cer:.4f} ({avg_cer * 100:.2f}%)")
+            if avg_bcer is not None:
+                print(f"  Eval bCER: {avg_bcer:.4f} ({avg_bcer * 100:.2f}%)")
+            else:
+                print(f"  Eval bCER: N/A (no boundary markers)")
+            print(f"{'='*60}\n")
+
+            metrics[f"{metric_key_prefix}_cer"] = avg_cer
+            metrics[f"{metric_key_prefix}_bcer"] = avg_bcer if avg_bcer is not None else 0.0
+
+        # Sync across processes
+        if self.accelerator.num_processes > 1:
+            self.accelerator.wait_for_everyone()
+
+        if is_gc:
+            unwrapped_model.gradient_checkpointing_enable()
+        if was_training:
+            unwrapped_model.train()
+
+        # Log to wandb
+        if self.accelerator.is_main_process and metrics:
+            if is_wandb_available() and wandb.run is not None:
+                wandb.log(metrics, step=self.state.global_step)
+
+        self.control = self.callback_handler.on_evaluate(
+            self.args, self.state, self.control, metrics
+        )
+
+        return metrics
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics

@@ -22,6 +22,12 @@ def _strip_punctuation(text: str) -> str:
 # Module-level storage for CGPR component metrics (accessed by trainer for wandb logging)
 cgpr_metrics = {"cer": [], "bwer": [], "dense_reward": []}
 
+# Module-level storage for CGPR+ component metrics (accessed by trainer for wandb logging)
+cgpr_plus_metrics = {"cer": [], "script_fidelity": []}
+
+# Module-level storage for script fidelity metrics (accessed by trainer for wandb logging)
+script_fidelity_metrics = {"cer": [], "script_distance": []}
+
 # Optional Chinese support - not needed for AfriSpeech (English)
 try:
     import zhconv
@@ -299,6 +305,128 @@ def cer_reward(completions, solution, language="en", **kwargs):
                 f.write(f"Sample {idx} | Language: {lang}\n")
                 f.write(f"Prediction: {pred[:200]}{'...' if len(pred) > 200 else ''}\n")
                 f.write(f"Reference:  {ref[:200]}{'...' if len(ref) > 200 else ''}\n")
+
+    return rewards
+
+
+def _get_script(char: str) -> str:
+    """Classify a character into its Unicode script category."""
+    cp = ord(char)
+    if 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F or 0x08A0 <= cp <= 0x08FF or 0xFB50 <= cp <= 0xFDFF or 0xFE70 <= cp <= 0xFEFF:
+        return "Arabic"
+    if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF or 0x20000 <= cp <= 0x2A6DF or 0xF900 <= cp <= 0xFAFF:
+        return "CJK"
+    if 0x3040 <= cp <= 0x309F:
+        return "Hiragana"
+    if 0x30A0 <= cp <= 0x30FF:
+        return "Katakana"
+    if 0xAC00 <= cp <= 0xD7AF or 0x1100 <= cp <= 0x11FF or 0x3130 <= cp <= 0x318F:
+        return "Hangul"
+    if 0x0400 <= cp <= 0x04FF or 0x0500 <= cp <= 0x052F:
+        return "Cyrillic"
+    if 0x0900 <= cp <= 0x097F:
+        return "Devanagari"
+    if (0x0041 <= cp <= 0x005A) or (0x0061 <= cp <= 0x007A) or (0x00C0 <= cp <= 0x024F):
+        return "Latin"
+    return "Other"
+
+
+def _script_distribution(text: str) -> dict:
+    """Compute fraction of characters in each Unicode script, ignoring spaces/punctuation."""
+    counts = {}
+    total = 0
+    for c in text:
+        if c.isspace() or unicodedata.category(c).startswith('P'):
+            continue
+        script = _get_script(c)
+        if script == "Other":
+            continue
+        counts[script] = counts.get(script, 0) + 1
+        total += 1
+    if total == 0:
+        return {}
+    return {s: n / total for s, n in counts.items()}
+
+
+def _total_variation_distance(dist_a: dict, dist_b: dict) -> float:
+    """Total variation distance between two discrete distributions."""
+    all_keys = set(dist_a) | set(dist_b)
+    return 0.5 * sum(abs(dist_a.get(k, 0) - dist_b.get(k, 0)) for k in all_keys)
+
+
+def script_fidelity_reward(completions, solution, language="en", gamma=0.5, **kwargs):
+    """
+    Script Fidelity Reward — CER combined with script distribution matching.
+
+    Penalizes predictions that use the wrong writing system (e.g. outputting
+    Latin where Arabic or CJK should appear). Computed as:
+
+        reward = -CER - gamma * TVD(ref_scripts, pred_scripts)
+
+    where TVD is the total variation distance between the Unicode script
+    distributions of the reference and prediction (range [0, 1]).
+
+    For X-English training: reinforces producing the correct non-English
+    script, which should transfer to non-English pairs at test time.
+
+    Args:
+        completions: List of completions, each is a list with a dict containing "content"
+        solution: List of ground truth transcriptions
+        language: Language code or list of codes for CER normalization
+        gamma: Weight for the script distance penalty (default 0.5)
+        **kwargs: Additional arguments (ignored)
+
+    Returns:
+        List of rewards
+    """
+    contents = [completion[0]["content"] for completion in completions]
+    rewards = []
+    current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+
+    script_fidelity_metrics["cer"].clear()
+    script_fidelity_metrics["script_distance"].clear()
+
+    if isinstance(language, list):
+        languages = language
+    else:
+        languages = [language] * len(contents)
+
+    for idx, (content, sol, lang) in enumerate(zip(contents, solution, languages)):
+        # Extract answer from tags if present
+        content_match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL)
+        pred = content_match.group(1).strip() if content_match else content.strip()
+
+        sol_match = re.search(r"<answer>(.*?)</answer>", sol, re.DOTALL)
+        ref = sol_match.group(1).strip() if sol_match else sol.strip()
+
+        # Normalize
+        pred_norm = _remove_sp(pred, lang)
+        ref_norm = _remove_sp(ref, lang)
+
+        # CER component
+        cer = _compute_single_cer(ref_norm, pred_norm, lang)
+
+        # Script distribution distance
+        ref_dist = _script_distribution(ref_norm)
+        pred_dist = _script_distribution(pred_norm)
+        tvd = _total_variation_distance(ref_dist, pred_dist)
+
+        reward = -cer - gamma * tvd
+        rewards.append(reward)
+
+        script_fidelity_metrics["cer"].append(cer)
+        script_fidelity_metrics["script_distance"].append(tvd)
+
+        if os.getenv("DEBUG_MODE") == "true":
+            log_path = os.getenv("LOG_PATH")
+            with open(log_path, "a") as f:
+                f.write(f"------------- {current_time} Script Fidelity reward: {reward:.4f} -------------\n")
+                f.write(f"Sample {idx} | Language: {lang}\n")
+                f.write(f"CER: {cer:.4f}, Script TVD: {tvd:.4f} (gamma={gamma})\n")
+                f.write(f"Ref scripts:  {ref_dist}\n")
+                f.write(f"Pred scripts: {pred_dist}\n")
+                f.write(f"Prediction: {pred_norm[:200]}{'...' if len(pred_norm) > 200 else ''}\n")
+                f.write(f"Reference:  {ref_norm[:200]}{'...' if len(ref_norm) > 200 else ''}\n")
 
     return rewards
 
@@ -804,5 +932,281 @@ def cgpr_shaped_reward(
                         status = ent["status"].upper()
                         f.write(f"  [{status}] '{ent['entity']}' "
                                f"conf={ent['confidence']:.3f} reward={ent['reward']:+.4f}\n")
+
+    return rewards
+
+
+# =============================================================================
+# CGPR+ (Entity Preservation + Script Fidelity Rewards) Implementation
+# =============================================================================
+
+def _char_similarity(a: str, b: str) -> float:
+    """1 - normalized_edit_distance between two strings."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    distance = ed.eval(list(a), list(b))
+    max_len = max(len(a), len(b))
+    return 1.0 - distance / max_len
+
+
+def _best_substring_similarity(hypothesis: str, target: str, tolerance: float = 0.3) -> float:
+    """
+    Sliding window search: find the best matching substring of hypothesis to target.
+
+    Searches windows of length len(target) * (1 +/- tolerance). Early exit at sim > 0.95.
+
+    Args:
+        hypothesis: The full predicted text to search within
+        target: The target string to find
+        tolerance: Fraction by which window size can vary from target length
+
+    Returns:
+        Best character similarity score found (0.0 to 1.0)
+    """
+    if not hypothesis or not target:
+        return 0.0
+
+    target_len = len(target)
+    min_window = max(1, int(target_len * (1 - tolerance)))
+    max_window = int(target_len * (1 + tolerance))
+
+    best_sim = 0.0
+
+    for window_size in range(min_window, max_window + 1):
+        if window_size > len(hypothesis):
+            continue
+        for start in range(len(hypothesis) - window_size + 1):
+            substring = hypothesis[start:start + window_size]
+            sim = _char_similarity(substring, target)
+            if sim > best_sim:
+                best_sim = sim
+            if best_sim > 0.95:
+                return best_sim
+
+    return best_sim
+
+
+# Mapping from ISO 639-3 language codes to their expected Unicode script categories
+LANG_TO_SCRIPTS = {
+    "ara": {"Arabic"},
+    "cmn": {"CJK"},
+    "zho": {"CJK"},
+    "jpn": {"CJK", "Hiragana", "Katakana"},
+    "kor": {"Hangul"},
+    "rus": {"Cyrillic"},
+    "hin": {"Devanagari"},
+    "eng": {"Latin"},
+    "spa": {"Latin"},
+    "fra": {"Latin"},
+    "deu": {"Latin"},
+    "por": {"Latin"},
+    "ita": {"Latin"},
+    "vie": {"Latin"},
+    "tur": {"Latin"},
+    "pol": {"Latin"},
+    "nld": {"Latin"},
+    "hun": {"Latin"},
+    "ces": {"Latin"},
+    "ind": {"Latin"},
+}
+
+
+def _get_allowed_scripts(language_pair: str) -> set:
+    """
+    Get the union of allowed scripts for both languages in a pair.
+
+    Args:
+        language_pair: Language pair code like "ara-eng", "cmn-eng"
+
+    Returns:
+        Set of allowed script names (e.g., {"Arabic", "Latin"})
+    """
+    parts = []
+    if "-" in language_pair:
+        parts = language_pair.lower().split("-")
+    elif "_" in language_pair:
+        parts = language_pair.lower().split("_")
+    else:
+        parts = [language_pair.lower()]
+
+    allowed = set()
+    for part in parts:
+        scripts = LANG_TO_SCRIPTS.get(part, set())
+        allowed.update(scripts)
+
+    # Always allow Latin (numbers, common abbreviations, etc.)
+    allowed.add("Latin")
+
+    return allowed
+
+
+def _compute_script_contamination(text: str, allowed_scripts: set) -> float:
+    """
+    Compute the fraction of non-space, non-punctuation characters that belong
+    to a disallowed writing system.
+
+    Args:
+        text: Predicted text to check
+        allowed_scripts: Set of allowed script names
+
+    Returns:
+        Fraction of characters in disallowed scripts (0.0 to 1.0)
+    """
+    total = 0
+    disallowed = 0
+
+    for c in text:
+        if c.isspace() or unicodedata.category(c).startswith('P') or c.isdigit():
+            continue
+        script = _get_script(c)
+        if script == "Other":
+            continue
+        total += 1
+        if script not in allowed_scripts:
+            disallowed += 1
+
+    if total == 0:
+        return 0.0
+    return disallowed / total
+
+
+def _count_script_transitions(text: str) -> int:
+    """
+    Count the number of writing-system transitions in text.
+
+    Scans non-space, non-punctuation characters and counts each time the
+    Unicode script category changes (e.g., Arabic -> Latin, Latin -> CJK).
+    This measures the code-switching structure of the output.
+    """
+    prev_script = None
+    transitions = 0
+    for c in text:
+        if c.isspace() or unicodedata.category(c).startswith('P') or c.isdigit():
+            continue
+        script = _get_script(c)
+        if script == "Other":
+            continue
+        if prev_script is not None and script != prev_script:
+            transitions += 1
+        prev_script = script
+    return transitions
+
+
+def cgpr_plus_reward(
+    completions,
+    solution,
+    raw_text: Optional[list] = None,
+    language: str = "en",
+    raw_language: Optional[list] = None,
+    beta_switch: float = 0.1,
+    beta_script: float = 0.1,
+    **kwargs
+) -> list:
+    """
+    CER + Switch Transition Fidelity Reward + Script Fidelity Reward.
+
+    Reward = -CER + beta_switch * switch_fidelity + beta_script * script_fidelity
+
+    1. Switch transition fidelity reward: counts the number of writing-system
+       transitions in the hypothesis and compares to the number of code-switch
+       boundaries in the reference (from ** markers). Rewards matching switch
+       structure, penalizes language collapse (too few transitions) or
+       hallucinated switches (too many transitions). Non-redundant with CER
+       because CER is blind to *which* script produced the characters.
+    2. Script fidelity reward: rewards using the correct writing systems for the
+       language pair.
+
+    Args:
+        completions: List of completions, each is a list with a dict containing "content"
+        solution: List of ground truth transcriptions
+        raw_text: List of reference texts with ** markers (one per sample, repeated for generations)
+        language: Language code or list of codes for normalization
+        raw_language: Raw language pair codes (e.g., ["ara-eng"]) for script detection
+        beta_switch: Coefficient for switch fidelity reward (default 0.1)
+        beta_script: Coefficient for script fidelity reward (default 0.1)
+        **kwargs: Additional arguments (ignored)
+
+    Returns:
+        List of rewards (one per completion)
+    """
+    contents = [completion[0]["content"] for completion in completions]
+    rewards = []
+    current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+
+    # Clear previous metrics
+    cgpr_plus_metrics["cer"].clear()
+    cgpr_plus_metrics["script_fidelity"].clear()
+
+    # Handle language as list or single value
+    if isinstance(language, list):
+        languages = language
+    else:
+        languages = [language] * len(contents)
+
+    # Handle raw_language for script detection
+    if raw_language is None:
+        raw_languages = [None] * len(contents)
+    elif isinstance(raw_language, str):
+        raw_languages = [raw_language] * len(contents)
+    elif isinstance(raw_language, list):
+        raw_languages = raw_language
+    else:
+        raw_languages = [None] * len(contents)
+
+    # Handle raw_text (with ** markers) as list
+    if raw_text is None:
+        raw_texts = [None] * len(contents)
+    elif isinstance(raw_text, str):
+        raw_texts = [raw_text] * len(contents)
+    elif isinstance(raw_text, list):
+        raw_texts = raw_text
+    else:
+        raw_texts = [None] * len(contents)
+
+    for idx, (content, sol, lang) in enumerate(zip(contents, solution, languages)):
+        raw_lang = raw_languages[idx] if idx < len(raw_languages) else None
+        sample_raw_text = raw_texts[idx] if idx < len(raw_texts) else None
+
+        # Extract answer from tags if present
+        content_match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL)
+        pred = content_match.group(1).strip() if content_match else content.strip()
+
+        sol_match = re.search(r"<answer>(.*?)</answer>", sol, re.DOTALL)
+        ref = sol_match.group(1).strip() if sol_match else sol.strip()
+
+        # Remove special tokens and normalize
+        pred = _remove_sp(pred, lang)
+        ref = _remove_sp(ref, lang)
+
+        # 1. CER terminal reward
+        cer = _compute_single_cer(ref, pred, lang)
+        terminal_reward = -cer
+
+        # 2. Script fidelity reward: binary — full reward if no disallowed chars, else 0
+        script_fidelity = 0.0
+        if raw_lang:
+            allowed = _get_allowed_scripts(raw_lang)
+            contamination = _compute_script_contamination(pred, allowed)
+            script_fidelity = beta_script if contamination == 0.0 else 0.0
+
+        # Total reward
+        reward = terminal_reward + script_fidelity
+        rewards.append(reward)
+
+        # Store metrics
+        cgpr_plus_metrics["cer"].append(cer)
+        cgpr_plus_metrics["script_fidelity"].append(script_fidelity)
+
+        if os.getenv("DEBUG_MODE") == "true":
+            log_path = os.getenv("LOG_PATH")
+            with open(log_path, "a") as f:
+                f.write(f"------------- {current_time} CGPR+ reward: {reward:.4f} -------------\n")
+                f.write(f"Sample {idx} | Language: {lang} | Raw: {raw_lang}\n")
+                f.write(f"Terminal: {terminal_reward:.4f} (CER: {cer:.4f})\n")
+                f.write(f"Script fidelity: {script_fidelity:+.4f}\n")
+                f.write(f"Prediction: {pred[:200]}{'...' if len(pred) > 200 else ''}\n")
+                f.write(f"Reference:  {ref[:200]}{'...' if len(ref) > 200 else ''}\n")
 
     return rewards

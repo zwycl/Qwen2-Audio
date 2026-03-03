@@ -1,31 +1,27 @@
 #!/bin/bash
 
 # ============================================================================
-# Evaluation Script for ContextASR-Bench
+# Evaluation Script for SwitchLingua Code-Switched Speech Recognition
 # ============================================================================
 #
-# This script evaluates Qwen2-Audio on ContextASR-Bench using WER and B-WER metrics.
-# It evaluates on examples NOT used in training (skips first N examples).
+# SwitchLingua (NeurIPS 2025): 80+ hours, 11 X-English language pairs.
+# Languages: Arabic, Cantonese, French, German, Hindi, Italian, Japanese,
+#            Korean, Mandarin, Russian, Spanish
 #
 # Usage:
-#   # Single GPU (default)
-#   ./run_eval_contextasr.sh raw 100
-#
-#   # Multi-GPU (8 GPUs in parallel)
-#   ./run_eval_contextasr.sh raw 100 Dialogue English 1000 8
-#
-#   # Examples:
-#   ./run_eval_contextasr.sh                              # Raw model, 100 examples, 1 GPU
-#   ./run_eval_contextasr.sh ./outputs/checkpoint-30      # Checkpoint, 1 GPU
-#   ./run_eval_contextasr.sh raw 200 Dialogue English 1000 8  # 8 GPUs
+#   ./run_eval_switchlingua.sh                              # Raw model, 100 examples
+#   ./run_eval_switchlingua.sh raw 5 Italian                # 5 Italian examples
+#   ./run_eval_switchlingua.sh raw 100 all 0 4              # 4 GPUs, all languages
+#   ./run_eval_switchlingua.sh ./outputs/checkpoint-30 100  # Checkpoint eval
 #
 # Arguments:
 #   $1 - Model path or "raw" for base model (default: raw)
 #   $2 - Number of examples to evaluate (default: 100)
-#   $3 - Dataset config short name: Dialogue or Speech (default: Dialogue)
-#   $4 - Language: English or Mandarin (default: English)
-#   $5 - Number of training examples to skip (default: 1000)
-#   $6 - Number of GPUs (default: 1, set to 8 for multi-GPU)
+#   $3 - Language: Arabic, Cantonese, French, German, Hindi, Italian,
+#        Japanese, Korean, Mandarin, Russian, Spanish, or "all" (default: all)
+#   $4 - Number of examples to skip (default: 0)
+#   $5 - Number of GPUs (default: 1)
+#   $6 - Two-step evaluation: true/false (default: false)
 #
 # ============================================================================
 
@@ -34,13 +30,10 @@ cd /home/ubuntu/Qwen2-Audio/r1-aqa-main
 # Parse arguments
 MODEL_PATH="${1:-raw}"
 NUM_EXAMPLES="${2:-100}"
-DATASET_CONFIG_SHORT="${3:-Dialogue}"
-LANGUAGE="${4:-English}"
-SKIP_EXAMPLES="${5:-1000}"
-NUM_GPUS="${6:-1}"
-
-# Expand config name
-DATASET_CONFIG="ContextASR-${DATASET_CONFIG_SHORT}"
+LANGUAGE="${3:-all}"
+SKIP_EXAMPLES="${4:-0}"
+NUM_GPUS="${5:-1}"
+TWO_STEP="${6:-false}"
 
 # Handle "raw" as base model
 RAW_PROMPT_FLAG=""
@@ -53,54 +46,70 @@ else
 fi
 
 # Data directory
-DATA_DIR="/home/ubuntu/Qwen2-Audio/contextasr_data"
+DATA_DIR="/home/ubuntu/Qwen2-Audio/SwitchLingua_audio"
 
-# Output file for detailed results
+# Output file
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_DIR="./outputs/eval_results"
-OUTPUT_FILE="${OUTPUT_DIR}/eval_${MODEL_NAME}_${DATASET_CONFIG}_${LANGUAGE}_n${NUM_EXAMPLES}_${TIMESTAMP}.json"
+if [ "${LANGUAGE}" = "all" ]; then
+    OUTPUT_FILE="${OUTPUT_DIR}/eval_switchlingua_${MODEL_NAME}_all_n${NUM_EXAMPLES}_${TIMESTAMP}.json"
+else
+    OUTPUT_FILE="${OUTPUT_DIR}/eval_switchlingua_${MODEL_NAME}_${LANGUAGE}_n${NUM_EXAMPLES}_${TIMESTAMP}.json"
+fi
 
 echo "=============================================="
-echo "ContextASR Evaluation"
+echo "SwitchLingua Evaluation"
 echo "=============================================="
 echo "Model:       ${MODEL_PATH}"
-echo "Config:      ${DATASET_CONFIG}"
 echo "Language:    ${LANGUAGE}"
 echo "Eval size:   ${NUM_EXAMPLES} examples"
-echo "Skip:        ${SKIP_EXAMPLES} (training set)"
+echo "Skip:        ${SKIP_EXAMPLES}"
 echo "GPUs:        ${NUM_GPUS}"
+echo "Two-step:    ${TWO_STEP}"
 echo "Output:      ${OUTPUT_FILE}"
 echo "=============================================="
 
 # Create output directory
 mkdir -p "${OUTPUT_DIR}"
 
+# Build language argument
+LANG_ARGS=""
+if [ "${LANGUAGE}" != "all" ]; then
+    LANG_ARGS="--language ${LANGUAGE}"
+fi
+
+# Build two-step argument
+TWO_STEP_ARGS=""
+if [ "${TWO_STEP}" = "true" ]; then
+    TWO_STEP_ARGS="--two_step"
+fi
+
 # Run evaluation
 if [ "${NUM_GPUS}" -gt 1 ]; then
     echo "Running multi-GPU evaluation with ${NUM_GPUS} GPUs..."
     torchrun --nproc_per_node=${NUM_GPUS} \
-        --master_port=29500 \
-        src/evaluate_contextasr.py \
+        --master_port=29502 \
+        src/evaluate_switchlingua.py \
         --model_name_or_path "${MODEL_PATH}" \
         --data_dir "${DATA_DIR}" \
-        --dataset_config "${DATASET_CONFIG}" \
-        --language "${LANGUAGE}" \
         --skip_examples "${SKIP_EXAMPLES}" \
         --num_examples "${NUM_EXAMPLES}" \
         --output_file "${OUTPUT_FILE}" \
-        ${RAW_PROMPT_FLAG}
+        ${LANG_ARGS} \
+        ${RAW_PROMPT_FLAG} \
+        ${TWO_STEP_ARGS}
 else
     echo "Running single-GPU evaluation..."
-    python src/evaluate_contextasr.py \
+    python src/evaluate_switchlingua.py \
         --model_name_or_path "${MODEL_PATH}" \
         --data_dir "${DATA_DIR}" \
-        --dataset_config "${DATASET_CONFIG}" \
-        --language "${LANGUAGE}" \
         --skip_examples "${SKIP_EXAMPLES}" \
         --num_examples "${NUM_EXAMPLES}" \
         --output_file "${OUTPUT_FILE}" \
         --verbose \
-        ${RAW_PROMPT_FLAG}
+        ${LANG_ARGS} \
+        ${RAW_PROMPT_FLAG} \
+        ${TWO_STEP_ARGS}
 fi
 
 echo ""

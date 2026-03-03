@@ -1,7 +1,3 @@
-# ContextASR dataset
-contextasr_data/
-contextasr_data_test/
-
 # AfriSpeech dataset
 afrispeech_data/
 

@@ -7,24 +7,29 @@
 # This script trains Qwen2-Audio on CS-FLEURS using GRPO with WER reward.
 # CS-FLEURS contains 113 unique code-switched language pairs across 52 languages.
 #
+# Audio chunking:
+#   - Uses VAD (Voice Activity Detection) to segment at speech boundaries
+#   - Merges short segments, ensures max 30s chunks
+#   - Aligns transcripts to VAD boundaries
+#
 # Usage:
-#   ./run_csfleurs.sh                                    # Default: xtts_train, all languages, wer reward
-#   ./run_csfleurs.sh xtts_train                         # Specific subset
-#   ./run_csfleurs.sh xtts_train ara-eng                 # Specific language pair
-#   ./run_csfleurs.sh xtts_train ara-eng 1000            # With sample limit
-#   ./run_csfleurs.sh xtts_train all 1000 false          # 1000 samples, no two-step
-#   ./run_csfleurs.sh xtts_train all 1000 true           # 1000 samples, two-step training
-#   ./run_csfleurs.sh xtts_train all 1000 true wer       # two-step, WER reward
-#   ./run_csfleurs.sh xtts_train all 1000 true cer       # two-step, CER reward
-#   ./run_csfleurs.sh xtts_train all 1000 true mixed     # two-step, mixed WER+CER reward
-#   ./run_csfleurs.sh xtts_train all 1000 true cgpr      # two-step, CGPR reward (RECOMMENDED)
-#   ./run_csfleurs.sh xtts_train all 1000 true format    # two-step, FORMAT-ONLY (baseline)
+#   ./run_csfleurs.sh                                          # Default: VAD chunking enabled
+#   ./run_csfleurs.sh xtts_train                               # Specific subset
+#   ./run_csfleurs.sh xtts_train ara-eng                       # Specific language pair
+#   ./run_csfleurs.sh xtts_train ara-eng 1000                  # With sample limit
+#   ./run_csfleurs.sh xtts_train all 1000 false                # 1000 samples, no two-step
+#   ./run_csfleurs.sh xtts_train all 1000 true                 # two-step training
+#   ./run_csfleurs.sh xtts_train all 1000 true cer             # two-step, CER reward
+#   ./run_csfleurs.sh xtts_train all 1000 true cgpr            # two-step, CGPR reward (RECOMMENDED)
+#   ./run_csfleurs.sh xtts_train all 1000 true cgpr true       # VAD chunking (default)
+#   ./run_csfleurs.sh xtts_train all 1000 true cgpr false      # No VAD chunking
 #
 # Reward types:
 #   wer    - Word Error Rate (default)
 #   cer    - Character Error Rate (good for code-switched/Chinese)
 #   mixed  - Combined WER + CER (50/50 by default)
 #   cgpr   - Confidence-Gated Process Rewards (dense rewards on code-switched entities)
+#   cgpr_plus - CGPR + anti-translation contrastive penalty + script contamination penalty
 #   format - Format-only baseline (no ASR reward, just <answer> tag compliance)
 #
 # Subsets:
@@ -49,7 +54,11 @@ LANGUAGE_PAIR="${2:-all}"                    # Language pair (e.g., ara-eng, cmn
 NUM_EXAMPLES="${3:-1000}"                    # Number of training examples
 TWO_STEP="${4:-false}"                       # Two-step training
 REWARD_TYPE="${5:-cer}"                      # Reward type: wer, cer, or mixed
-RESUME_CHECKPOINT="${6:-}"                   # Resume from checkpoint (optional)
+USE_VAD="false"                              # VAD chunking disabled
+EVAL_STEPS="${6:-50}"                        # Evaluate every N steps
+MAX_EVAL_SAMPLES="${7:-200}"                 # Max validation samples for eval
+SEED="${8:-42}"                              # Random seed
+RESUME_CHECKPOINT="${9:-}"                   # Resume from checkpoint (optional, last arg)
 
 # Data path (local clone of cs-fleurs)
 DATA_DIR="/home/ubuntu/Qwen2-Audio/csfleurs_data"
@@ -63,8 +72,13 @@ NUM_GENERATIONS=8
 BATCH_SIZE=1
 GRAD_ACCUM=8
 LEARNING_RATE=1e-6
-NUM_EPOCHS=2
-SAVE_STEPS=15
+# Two-step does 2 GRPO updates per step, so halve epochs to equalize gradient updates
+if [ "${TWO_STEP}" = "true" ]; then
+    NUM_EPOCHS=4
+else
+    NUM_EPOCHS=8
+fi
+SAVE_STEPS=50
 MAX_AUDIO_DURATION=30.0
 
 # Output directory
@@ -76,13 +90,24 @@ fi
 if [ "${TWO_STEP}" = "true" ]; then
     OUT_DIR="${OUT_DIR}_twostep"
 fi
+if [ "${USE_VAD}" = "true" ]; then
+    OUT_DIR="${OUT_DIR}_vad"
+else
+    OUT_DIR="${OUT_DIR}_novad"
+fi
+OUT_DIR="${OUT_DIR}_s${SEED}"
 
 # WandB settings
 USE_WANDB="true"
-if [ "${LANGUAGE_PAIR}" = "all" ]; then
-    RUN_NAME="CSFleurs-${SUBSET}-${REWARD_TYPE}-n${NUM_EXAMPLES}-e${NUM_EPOCHS}-GRPO"
+if [ "${USE_VAD}" = "true" ]; then
+    VAD_TAG="vad"
 else
-    RUN_NAME="CSFleurs-${SUBSET}-${LANGUAGE_PAIR}-${REWARD_TYPE}-n${NUM_EXAMPLES}-e${NUM_EPOCHS}-GRPO"
+    VAD_TAG="novad"
+fi
+if [ "${LANGUAGE_PAIR}" = "all" ]; then
+    RUN_NAME="CSFleurs-${SUBSET}-${REWARD_TYPE}-n${NUM_EXAMPLES}-e${NUM_EPOCHS}-${VAD_TAG}-s${SEED}-GRPO"
+else
+    RUN_NAME="CSFleurs-${SUBSET}-${LANGUAGE_PAIR}-${REWARD_TYPE}-n${NUM_EXAMPLES}-e${NUM_EPOCHS}-${VAD_TAG}-s${SEED}-GRPO"
 fi
 
 echo "=============================================="
@@ -94,6 +119,8 @@ echo "Examples:     ${NUM_EXAMPLES}"
 echo "Epochs:       ${NUM_EPOCHS}"
 echo "Reward:       ${REWARD_TYPE}"
 echo "Two-step:     ${TWO_STEP}"
+echo "VAD chunk:    ${USE_VAD}"
+echo "Seed:         ${SEED}"
 echo "Data dir:     ${DATA_DIR}"
 if [ "${TWO_STEP}" = "true" ]; then
     echo "  Pass 1: Draft transcription"
@@ -116,6 +143,12 @@ fi
 TWO_STEP_ARGS=""
 if [ "${TWO_STEP}" = "true" ]; then
     TWO_STEP_ARGS="--two_step_training"
+fi
+
+# Build VAD chunking argument
+VAD_ARGS=""
+if [ "${USE_VAD}" = "false" ]; then
+    VAD_ARGS="--use_vad_chunking False"
 fi
 
 # Run training
@@ -141,9 +174,15 @@ if [ -n "${RESUME_CHECKPOINT}" ]; then
         --save_steps ${SAVE_STEPS} \
         --run_name ${RUN_NAME} \
         --reward_type ${REWARD_TYPE} \
+        --cgpr_beta_translation 0.05 \
+        --cgpr_beta_script 0.05 \
+        --eval_steps ${EVAL_STEPS} \
+        --max_eval_samples ${MAX_EVAL_SAMPLES} \
+        --seed ${SEED} \
         --resume_from_checkpoint "${RESUME_CHECKPOINT}" \
         ${LANG_ARGS} \
-        ${TWO_STEP_ARGS}
+        ${TWO_STEP_ARGS} \
+        ${VAD_ARGS}
 else
     torchrun --nproc_per_node=${NUM_GPUS} \
         --nnodes=1 \
@@ -166,6 +205,12 @@ else
         --save_steps ${SAVE_STEPS} \
         --run_name ${RUN_NAME} \
         --reward_type ${REWARD_TYPE} \
+        --cgpr_beta_translation 0.05 \
+        --cgpr_beta_script 0.05 \
+        --eval_steps ${EVAL_STEPS} \
+        --max_eval_samples ${MAX_EVAL_SAMPLES} \
+        --seed ${SEED} \
         ${LANG_ARGS} \
-        ${TWO_STEP_ARGS}
+        ${TWO_STEP_ARGS} \
+        ${VAD_ARGS}
 fi

@@ -13,16 +13,23 @@ Subsets:
 - xtts_test1: 16 X-English pairs, 36 hours (generative TTS)
 - xtts_test2: 60 {Arabic, Chinese, Hindi, Spanish}-X pairs, 42 hours
 - mms_test: 45 X-English pairs, 56 hours (concatenative TTS)
+
+Audio chunking approach:
+- Use VAD to segment utterances at natural speech boundaries
+- Merge short segments, ensure max 30s chunks
+- Align transcripts to VAD boundaries
 """
 
 import logging
-from typing import Optional
+from typing import Optional, List, Dict
 
 import numpy as np
 import torch
 import torchaudio
 from datasets import load_dataset
 from torch.utils.data import Dataset
+
+from .vad_chunking import VADChunker, parallel_vad_chunk_files
 
 
 # Subset name to directory path mapping
@@ -86,16 +93,38 @@ LANG_CODE_TO_TOKEN = {
 
 
 def _get_language_name(lang_code: str) -> str:
-    """Convert language code (e.g., 'ara-eng') to readable name."""
+    """Convert language code (e.g., 'ara-eng') to readable name of the primary language."""
     if "-" in lang_code:
-        # Format: "ara-eng" -> extract first language
         primary = lang_code.split("-")[0]
     elif "_" in lang_code:
-        # Format: "arabic_english" -> extract first language
         primary = lang_code.split("_")[0]
     else:
         primary = lang_code
     return LANG_CODE_TO_NAME.get(primary, primary.capitalize())
+
+
+def _get_language_pair_names(lang_code: str) -> tuple:
+    """Convert language pair code to both language names.
+
+    Returns (primary_name, secondary_name). If only one code is present,
+    secondary defaults to None.
+
+    Examples:
+        'cmn-deu' -> ('Chinese', 'German')
+        'ara-eng' -> ('Arabic', 'English')
+        'cmn'     -> ('Chinese', None)
+    """
+    parts = []
+    if "-" in lang_code:
+        parts = lang_code.split("-")
+    elif "_" in lang_code:
+        parts = lang_code.split("_")
+    else:
+        parts = [lang_code]
+
+    primary = LANG_CODE_TO_NAME.get(parts[0], parts[0].capitalize())
+    secondary = LANG_CODE_TO_NAME.get(parts[1], parts[1].capitalize()) if len(parts) > 1 else None
+    return primary, secondary
 
 
 def _get_language_token(lang_code: str) -> str:
@@ -224,7 +253,7 @@ def _extract_code_switch_entities(text: str, language: str = None) -> tuple:
 # For code-switched ASR, we inform the model about the language pair
 CSFLEURS_PROMPT_TEMPLATE = (
     "You are a speech transcription system for code-switched speech. "
-    "The audio contains speech mixing {language} and English. "
+    "The audio contains speech mixing {lang1} and {lang2}. "
     "Output ONLY the exact words spoken, preserving the language switches. "
     "Output the transcription in <answer> </answer>."
 )
@@ -264,8 +293,10 @@ class CSFleursDataset(Dataset):
         subset: Dataset subset ('read_test', 'xtts_train', 'xtts_test1', 'xtts_test2', 'mms_test')
         language_pair: Optional filter for specific language pair (e.g., 'chinese_english')
         num_examples: Number of examples to load (None for all)
-        max_audio_duration: Maximum audio duration in seconds (filter out longer)
+        max_audio_duration: Maximum audio duration in seconds (include longer, will be chunked)
+        max_audio_chunk: Maximum chunk duration for VAD splitting (default 30s)
         sample_rate: Target sample rate for audio
+        use_vad_chunking: Use VAD-based chunking for long audio (default True)
     """
 
     def __init__(
@@ -273,13 +304,26 @@ class CSFleursDataset(Dataset):
         subset: str = "xtts_train",
         language_pair: Optional[str] = None,
         num_examples: Optional[int] = None,
-        max_audio_duration: float = 30.0,
+        max_audio_duration: float = 60.0,  # Include longer audio, will be chunked
+        max_audio_chunk: float = 30.0,  # Max chunk size after VAD splitting
         sample_rate: int = 16000,
+        use_vad_chunking: bool = True,
     ):
         self.subset = subset
         self.language_pair = language_pair
         self.max_audio_duration = max_audio_duration
+        self.max_audio_chunk = max_audio_chunk
         self.sample_rate = sample_rate
+        self.use_vad_chunking = use_vad_chunking
+
+        # Initialize VAD chunker if enabled
+        self.vad_chunker = None
+        if use_vad_chunking:
+            logging.info("Initializing VAD chunker for CS-FLEURS dataset...")
+            self.vad_chunker = VADChunker(
+                max_chunk_duration=max_audio_chunk,
+                min_chunk_duration=0.5,
+            )
 
         logging.info(f"Loading CS-FLEURS dataset: subset={subset}, language_pair={language_pair}")
 
@@ -297,31 +341,83 @@ class CSFleursDataset(Dataset):
 
         logging.info(f"Loaded {len(self.hf_dataset)} examples from CS-FLEURS {subset}")
 
-        # Build sample list
+        # Build sample list with VAD chunking for long audio
         self.samples = []
+        total_chunks = 0
+        skipped_duration = 0
+
         for idx, item in enumerate(self.hf_dataset):
             # Filter by language pair if specified
             if language_pair and item.get("language", "").lower() != language_pair.lower():
                 continue
 
-            # Filter by duration
+            # Filter by max duration (skip very long audio)
             duration = item.get("duration", 0)
             if duration > max_audio_duration:
+                skipped_duration += 1
                 continue
 
-            self.samples.append({
-                "index": idx,
-                "text": item.get("text", ""),
-                "language": item.get("language", "unknown"),
-                "duration": duration,
-                "speaker": item.get("speaker", ""),
-                "id": item.get("id", f"sample_{idx}"),
-            })
+            text = item.get("text", "")
+            language = item.get("language", "unknown")
+            sample_id = item.get("id", f"sample_{idx}")
+
+            # For audio longer than max_audio_chunk, use VAD chunking
+            if use_vad_chunking and self.vad_chunker and duration > max_audio_chunk:
+                # Load audio for VAD processing
+                audio_info = item.get("audio", {})
+                if isinstance(audio_info, dict):
+                    audio = np.array(audio_info.get("array", []), dtype=np.float32)
+                    sr = audio_info.get("sampling_rate", 16000)
+                    if sr != sample_rate:
+                        audio_tensor = torch.from_numpy(audio).unsqueeze(0)
+                        audio = torchaudio.transforms.Resample(sr, sample_rate)(audio_tensor).squeeze().numpy()
+                else:
+                    continue  # Skip if audio not available
+
+                # Create VAD chunks
+                chunks = self.vad_chunker.chunk_audio(
+                    audio=audio,
+                    sample_rate=sample_rate,
+                    full_text=text,
+                    dialogue=None,
+                )
+
+                for chunk in chunks:
+                    self.samples.append({
+                        "index": idx,
+                        "text": chunk.get("text", text),
+                        "language": language,
+                        "duration": chunk["end"] - chunk["start"],
+                        "speaker": item.get("speaker", ""),
+                        "id": f"{sample_id}_chunk{chunk['chunk_id']}",
+                        "chunk_start": chunk["start"],
+                        "chunk_end": chunk["end"],
+                        "is_chunk": True,
+                    })
+                    total_chunks += 1
+            else:
+                # Short audio - use as-is
+                self.samples.append({
+                    "index": idx,
+                    "text": text,
+                    "language": language,
+                    "duration": duration,
+                    "speaker": item.get("speaker", ""),
+                    "id": sample_id,
+                    "chunk_start": 0.0,
+                    "chunk_end": duration,
+                    "is_chunk": False,
+                })
 
             if num_examples and len(self.samples) >= num_examples:
                 break
 
-        logging.info(f"Filtered to {len(self.samples)} samples (max_duration={max_audio_duration}s)")
+        chunking_method = "VAD" if use_vad_chunking and self.vad_chunker else "none"
+        logging.info(
+            f"CS-FLEURS {subset}: {len(self.samples)} samples "
+            f"({total_chunks} VAD chunks, {chunking_method} chunking, "
+            f"skipped {skipped_duration} over {max_audio_duration}s)"
+        )
 
     def __len__(self):
         return len(self.samples)
@@ -347,11 +443,20 @@ class CSFleursDataset(Dataset):
             # Fallback: try to load from path
             audio = _load_audio(str(audio_info), self.sample_rate)
 
+        # Extract chunk if this is a chunked sample
+        if sample.get("is_chunk", False):
+            start_sample = int(sample["chunk_start"] * self.sample_rate)
+            end_sample = int(sample["chunk_end"] * self.sample_rate)
+            audio = audio[start_sample:end_sample]
+
         # Build prompt
         language = sample["language"]
         if language and language.lower() != "unknown":
-            lang_name = _get_language_name(language)
-            prompt_text = CSFLEURS_PROMPT_TEMPLATE.format(language=lang_name)
+            lang1, lang2 = _get_language_pair_names(language)
+            if lang2:
+                prompt_text = CSFLEURS_PROMPT_TEMPLATE.format(lang1=lang1, lang2=lang2)
+            else:
+                prompt_text = CSFLEURS_PROMPT_TEMPLATE.format(lang1=lang1, lang2="English")
         else:
             prompt_text = CSFLEURS_BASIC_PROMPT_TEMPLATE
 
@@ -382,6 +487,11 @@ class CSFleursDataset(Dataset):
             "speaker": sample["speaker"],
             # Code-switched English phrases for CGPR reward
             "entity_list": entity_list,
+            # Raw text with ** markers for CS-WER computation
+            "raw_text": raw_text,
+            # Chunk metadata
+            "chunk_start": sample.get("chunk_start", 0.0),
+            "chunk_end": sample.get("chunk_end", sample["duration"]),
         }
 
 
@@ -396,12 +506,15 @@ class CSFleursDatasetLocal(Dataset):
         subset: Dataset subset (xtts_train, xtts_test1, xtts_test2, read_test, mms_test)
         language_pair: Optional filter for specific language pair (e.g., 'ara-eng')
         num_examples: Number of examples to load
-        max_audio_duration: Maximum audio duration in seconds
+        max_audio_duration: Maximum audio duration in seconds (include longer, will be chunked)
+        max_audio_chunk: Maximum chunk duration for VAD splitting (default 30s)
         sample_rate: Target sample rate
         stratify_languages: If True and language_pair is None, sample evenly across
             all language pairs instead of taking first N examples (default: True)
         filter_unsupported: If True, exclude languages not supported by Qwen2-Audio
             (hin, tur, pol, nld, hun, ces, vie, tha, ind) (default: True)
+        use_vad_chunking: Use VAD-based chunking for long audio (default True)
+        data_seed: Random seed for data subsampling (default: 42)
     """
 
     def __init__(
@@ -410,10 +523,13 @@ class CSFleursDatasetLocal(Dataset):
         subset: str = "xtts_train",
         language_pair: Optional[str] = None,
         num_examples: Optional[int] = None,
-        max_audio_duration: float = 30.0,
+        max_audio_duration: float = 60.0,  # Include longer audio, will be chunked
+        max_audio_chunk: float = 30.0,  # Max chunk size after VAD splitting
         sample_rate: int = 16000,
         stratify_languages: bool = True,
         filter_unsupported: bool = True,
+        use_vad_chunking: bool = True,
+        data_seed: int = 42,
     ):
         import json
         import random
@@ -424,17 +540,34 @@ class CSFleursDatasetLocal(Dataset):
         self.subset = subset
         self.language_pair = language_pair
         self.max_audio_duration = max_audio_duration
+        self.max_audio_chunk = max_audio_chunk
         self.sample_rate = sample_rate
+        self.use_vad_chunking = use_vad_chunking
+
+        # Initialize VAD chunker if enabled
+        self.vad_chunker = None
+        if use_vad_chunking:
+            logging.info("Initializing VAD chunker for CS-FLEURS Local dataset...")
+            self.vad_chunker = VADChunker(
+                max_chunk_duration=max_audio_chunk,
+                min_chunk_duration=0.5,
+            )
 
         # Map subset name to actual directory path
         subset_path = SUBSET_TO_PATH.get(subset, subset)
         subset_dir = self.data_dir / subset_path
 
-        # Load metadata
+        # Load metadata - prefer .marked.jsonl (with ** markers) over original
+        marked_path = subset_dir / "metadata.marked.jsonl"
         metadata_path = subset_dir / "metadata.jsonl"
-        if not metadata_path.exists():
+
+        if marked_path.exists():
+            metadata_path = marked_path
+            logging.info(f"Using marked metadata (with ** markers): {marked_path}")
+        elif not metadata_path.exists():
             # Try alternative paths
             alt_paths = [
+                self.data_dir / subset / "metadata.marked.jsonl",
                 self.data_dir / subset / "metadata.jsonl",
                 self.data_dir / f"{subset}_metadata.jsonl",
             ]
@@ -449,6 +582,16 @@ class CSFleursDatasetLocal(Dataset):
                 f"Metadata not found. Tried: {metadata_path}, {alt_paths}. "
                 f"Available subsets: {list(SUBSET_TO_PATH.keys())}"
             )
+
+        # Load translation cache for CGPR+ anti-translation penalty
+        self.translation_cache: Dict[str, Dict[str, str]] = {}
+        translation_cache_path = subset_dir / "translation_cache.json"
+        if translation_cache_path.exists():
+            with open(translation_cache_path, "r", encoding="utf-8") as f:
+                self.translation_cache = json.load(f)
+            logging.info(f"Loaded translation cache: {json.dumps({k: len(v) for k, v in self.translation_cache.items()})}")
+        else:
+            logging.info("No translation_cache.json found (CGPR+ anti-translation penalty will be inactive)")
 
         logging.info(f"Loading CS-FLEURS from {metadata_path}")
 
@@ -468,10 +611,12 @@ class CSFleursDatasetLocal(Dataset):
 
                 # Filter out unsupported languages if enabled
                 # Qwen2-Audio only supports: ar, zh, es, fr, de, pt, ru, ja, ko, it, en
+                # Check ALL languages in the pair (e.g., xtts_test2 has X-Y pairs
+                # where either side could be unsupported)
                 if filter_unsupported:
                     UNSUPPORTED_LANGS = {"hin", "tur", "pol", "nld", "hun", "ces", "vie", "tha", "ind", "slk", "tel"}
-                    primary_lang = item_lang.split("-")[0] if "-" in item_lang else item_lang
-                    if primary_lang in UNSUPPORTED_LANGS:
+                    lang_parts = item_lang.split("-") if "-" in item_lang else [item_lang]
+                    if any(lp in UNSUPPORTED_LANGS for lp in lang_parts):
                         continue
 
                 # Filter by duration
@@ -483,9 +628,15 @@ class CSFleursDatasetLocal(Dataset):
                 audio_filename = item.get("file_name", "")
                 audio_path = subset_dir / audio_filename
 
+                # text field may have ** markers (from marked.jsonl)
+                # text_original is the original text without markers (if from marked file)
+                text = item.get("text", "")
+                text_original = item.get("text_original", text)  # fallback to text if no original
+
                 sample = {
                     "audio_path": str(audio_path),
-                    "text": item.get("text", ""),
+                    "text": text,  # May have ** markers for CS-WER
+                    "text_original": text_original,  # Original without markers
                     "language": item.get("language", "unknown"),
                     "duration": duration,
                     "speaker": item.get("speaker", ""),
@@ -503,7 +654,7 @@ class CSFleursDatasetLocal(Dataset):
             logging.info(f"Stratified sampling: {num_examples} examples across {num_langs} language pairs")
             logging.info(f"  ~{samples_per_lang} examples per language pair")
 
-            self.samples = []
+            raw_samples = []
             lang_counts = {}
 
             # Sort languages for reproducibility
@@ -516,26 +667,99 @@ class CSFleursDatasetLocal(Dataset):
                 n_samples = min(n_samples, len(lang_samples))
 
                 # Shuffle and take n_samples
-                random.seed(42)  # For reproducibility
+                random.seed(data_seed)
                 random.shuffle(lang_samples)
-                self.samples.extend(lang_samples[:n_samples])
+                raw_samples.extend(lang_samples[:n_samples])
                 lang_counts[lang] = n_samples
 
             # Shuffle final samples
-            random.seed(42)
-            random.shuffle(self.samples)
+            random.seed(data_seed)
+            random.shuffle(raw_samples)
 
             logging.info(f"  Language distribution: {lang_counts}")
         else:
             # Original behavior: take first num_examples (or all if not specified)
-            self.samples = []
+            raw_samples = []
             for lang_samples in samples_by_lang.values():
-                self.samples.extend(lang_samples)
+                raw_samples.extend(lang_samples)
 
-            if num_examples and len(self.samples) > num_examples:
-                self.samples = self.samples[:num_examples]
+            if num_examples and len(raw_samples) > num_examples:
+                raw_samples = raw_samples[:num_examples]
 
-        logging.info(f"Loaded {len(self.samples)} samples from CS-FLEURS {subset}")
+        # Apply VAD chunking to create final samples
+        # For long audio, distribute VAD across all distributed ranks
+        self.samples = []
+        total_chunks = 0
+        skipped_vad = 0
+
+        # Identify which samples need VAD chunking (long audio)
+        vad_eligible = []
+        if use_vad_chunking and self.vad_chunker:
+            for i, sample in enumerate(raw_samples):
+                if sample.get("duration", 0) > max_audio_chunk:
+                    vad_eligible.append({
+                        "index": i,
+                        "audio_path": sample["audio_path"],
+                        "full_text": sample["text"],
+                        "dialogue": None,
+                    })
+
+        # Process VAD in parallel across distributed ranks
+        vad_results_map = {}
+        if vad_eligible:
+            logging.info(
+                f"Running VAD chunking on {len(vad_eligible)} long-audio files "
+                f"(distributed across available ranks)..."
+            )
+            vad_results = parallel_vad_chunk_files(
+                vad_eligible, self.vad_chunker, sample_rate, _load_audio
+            )
+            for result in vad_results:
+                vad_results_map[result["index"]] = result["chunks"]
+
+        # Build final samples from VAD results + short audio
+        for i, sample in enumerate(raw_samples):
+            duration = sample.get("duration", 0)
+
+            if i in vad_results_map:
+                chunks = vad_results_map[i]
+                if chunks is not None and len(chunks) > 0:
+                    for chunk in chunks:
+                        self.samples.append({
+                            **sample,
+                            "text": chunk.get("text", sample["text"]),
+                            "duration": chunk["end"] - chunk["start"],
+                            "id": f"{sample['id']}_chunk{chunk['chunk_id']}",
+                            "chunk_start": chunk["start"],
+                            "chunk_end": chunk["end"],
+                            "is_chunk": True,
+                        })
+                        total_chunks += 1
+                else:
+                    # VAD failed, fall back to whole audio
+                    skipped_vad += 1
+                    self.samples.append({
+                        **sample,
+                        "chunk_start": 0.0,
+                        "chunk_end": duration,
+                        "is_chunk": False,
+                    })
+            else:
+                # Short audio - use as-is
+                self.samples.append({
+                    **sample,
+                    "chunk_start": 0.0,
+                    "chunk_end": duration,
+                    "is_chunk": False,
+                })
+
+        chunking_method = "VAD (distributed)" if use_vad_chunking and self.vad_chunker else "none"
+        logging.info(
+            f"CS-FLEURS Local {subset}: {len(self.samples)} samples "
+            f"({total_chunks} VAD chunks created, {chunking_method} chunking)"
+        )
+        if skipped_vad > 0:
+            logging.warning(f"  VAD chunking failed for {skipped_vad} samples")
 
     def __len__(self):
         return len(self.samples)
@@ -546,17 +770,43 @@ class CSFleursDatasetLocal(Dataset):
         # Load audio
         audio = _load_audio(sample["audio_path"], self.sample_rate)
 
+        # Extract chunk if this is a chunked sample
+        if sample.get("is_chunk", False):
+            start_sample = int(sample["chunk_start"] * self.sample_rate)
+            end_sample = int(sample["chunk_end"] * self.sample_rate)
+            audio = audio[start_sample:end_sample]
+
         # Build prompt
         language = sample["language"]
         if language and language.lower() != "unknown":
-            lang_name = _get_language_name(language)
-            prompt_text = CSFLEURS_PROMPT_TEMPLATE.format(language=lang_name)
+            lang1, lang2 = _get_language_pair_names(language)
+            if lang2:
+                prompt_text = CSFLEURS_PROMPT_TEMPLATE.format(lang1=lang1, lang2=lang2)
+            else:
+                prompt_text = CSFLEURS_PROMPT_TEMPLATE.format(lang1=lang1, lang2="English")
         else:
             prompt_text = CSFLEURS_BASIC_PROMPT_TEMPLATE
 
         # Extract code-switched entities
         raw_text = sample["text"]
         clean_text, entity_list = _extract_code_switch_entities(raw_text, language)
+
+        # Build per-sample translation_map from entity_list + matrix language
+        translation_map = {}
+        if self.translation_cache and entity_list:
+            # Get matrix language (first component of pair)
+            if "-" in language:
+                matrix_lang = language.lower().split("-")[0]
+            elif "_" in language:
+                matrix_lang = language.lower().split("_")[0]
+            else:
+                matrix_lang = language.lower()
+
+            lang_translations = self.translation_cache.get(matrix_lang, {})
+            for entity in entity_list:
+                translation = lang_translations.get(entity.lower(), "")
+                if translation:
+                    translation_map[entity.lower()] = translation
 
         # Build conversation format
         prompt = [
@@ -581,4 +831,11 @@ class CSFleursDatasetLocal(Dataset):
             "speaker": sample["speaker"],
             # Code-switched English phrases for CGPR reward
             "entity_list": entity_list,
+            # Translation map for CGPR+ anti-translation penalty
+            "translation_map": translation_map,
+            # Raw text with ** markers for CS-WER computation
+            "raw_text": raw_text,
+            # Chunk metadata
+            "chunk_start": sample.get("chunk_start", 0.0),
+            "chunk_end": sample.get("chunk_end", sample["duration"]),
         }

@@ -4,8 +4,17 @@
 # Evaluation Script for CS-FLEURS Code-Switched Speech Recognition
 # ============================================================================
 #
-# This script evaluates Qwen2-Audio on CS-FLEURS using WER/CER metrics.
+# This script evaluates Qwen2-Audio on CS-FLEURS using CER and bCER metrics.
+# bCER (Boundary-CER): CER near language switch boundaries (±k chars)
+#   - Requires preprocessing with: python src/preprocess_csfleurs_markers.py
+#   - Measures model performance at code-switch transition points
+#   - Also reports nbCER (non-boundary CER) for comparison
 # It evaluates on examples NOT used in training (skips first N examples).
+#
+# Audio chunking:
+#   - Uses VAD (Voice Activity Detection) to segment at speech boundaries
+#   - Merges short segments, ensures max 30s chunks
+#   - Aligns transcripts to VAD boundaries
 #
 # Usage:
 #   # Single GPU (default)
@@ -13,6 +22,10 @@
 #
 #   # Multi-GPU (8 GPUs in parallel)
 #   ./run_eval_csfleurs.sh raw 100 xtts_train all 1000 8
+#
+#   # With VAD chunking control:
+#   ./run_eval_csfleurs.sh raw 100 xtts_train all 1000 8 true   # VAD chunking (default)
+#   ./run_eval_csfleurs.sh raw 100 xtts_train all 1000 8 false  # No chunking
 #
 #   # Examples:
 #   ./run_eval_csfleurs.sh                                    # Raw model, 100 examples, 1 GPU
@@ -26,6 +39,8 @@
 #   $4 - Language pair (e.g., ara-eng, cmn-eng) or 'all' (default: all)
 #   $5 - Number of training examples to skip (default: 1000)
 #   $6 - Number of GPUs (default: 1, set to 8 for multi-GPU)
+#   $7 - Use VAD chunking: true/false (default: true)
+#   $8 - Two-step evaluation: true/false (default: false) - draft then refine
 #
 # Subsets:
 #   read_test:  14 X-English pairs, 17 hours (read speech)
@@ -45,6 +60,8 @@ SUBSET="${3:-xtts_train}"
 LANGUAGE_PAIR="${4:-all}"
 SKIP_EXAMPLES="${5:-1000}"
 NUM_GPUS="${6:-1}"
+USE_VAD="${7:-true}"
+TWO_STEP="${8:-false}"
 
 # Handle "raw" as base model
 RAW_PROMPT_FLAG=""
@@ -77,6 +94,8 @@ echo "Language:    ${LANGUAGE_PAIR}"
 echo "Eval size:   ${NUM_EXAMPLES} examples"
 echo "Skip:        ${SKIP_EXAMPLES} (training set)"
 echo "GPUs:        ${NUM_GPUS}"
+echo "VAD chunk:   ${USE_VAD}"
+echo "Two-step:    ${TWO_STEP}"
 echo "Output:      ${OUTPUT_FILE}"
 echo "=============================================="
 
@@ -87,6 +106,12 @@ mkdir -p "${OUTPUT_DIR}"
 LANG_ARGS=""
 if [ "${LANGUAGE_PAIR}" != "all" ]; then
     LANG_ARGS="--language_pair ${LANGUAGE_PAIR}"
+fi
+
+# Build two-step argument
+TWO_STEP_ARGS=""
+if [ "${TWO_STEP}" = "true" ]; then
+    TWO_STEP_ARGS="--two_step"
 fi
 
 # Run evaluation
@@ -101,8 +126,10 @@ if [ "${NUM_GPUS}" -gt 1 ]; then
         --skip_examples "${SKIP_EXAMPLES}" \
         --num_examples "${NUM_EXAMPLES}" \
         --output_file "${OUTPUT_FILE}" \
+        --use_vad_chunking "${USE_VAD}" \
         ${LANG_ARGS} \
-        ${RAW_PROMPT_FLAG}
+        ${RAW_PROMPT_FLAG} \
+        ${TWO_STEP_ARGS}
 else
     echo "Running single-GPU evaluation..."
     python src/evaluate_csfleurs.py \
@@ -112,9 +139,11 @@ else
         --skip_examples "${SKIP_EXAMPLES}" \
         --num_examples "${NUM_EXAMPLES}" \
         --output_file "${OUTPUT_FILE}" \
+        --use_vad_chunking "${USE_VAD}" \
         --verbose \
         ${LANG_ARGS} \
-        ${RAW_PROMPT_FLAG}
+        ${RAW_PROMPT_FLAG} \
+        ${TWO_STEP_ARGS}
 fi
 
 echo ""

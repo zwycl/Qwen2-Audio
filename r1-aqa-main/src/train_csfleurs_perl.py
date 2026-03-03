@@ -1,39 +1,37 @@
 """
-Train Qwen2-Audio on CS-FLEURS for Code-Switched Speech Recognition.
+Train Qwen2-Audio on CS-FLEURS using PeRL (DoRA fine-tuning) with CGPR rewards.
 
-This script trains an audio model for Code-Switched Automatic Speech Recognition
-using GRPO (Group Relative Policy Optimization) with WER as the reward signal.
+This script integrates the PeRL parameter-efficient RL framework with
+CS-FLEURS code-switched speech recognition training.
 
-CS-FLEURS contains 113 unique code-switched language pairs across 52 languages.
+Key features:
+- DoRA (Weight-decomposed LoRA) - outperforms standard LoRA for RLVR tasks
+- All existing reward types: WER, CER, mixed, CGPR
+- Two-step training support
+- VAD-based audio chunking
 
 Usage:
-    # Basic training on xtts_train subset
-    python train_csfleurs.py \
+    # Train with DoRA (recommended)
+    python train_csfleurs_perl.py \
         --config_path configs/zero2.json \
         --model_name_or_path Qwen/Qwen2-Audio-7B-Instruct \
-        --subset xtts_train \
-        --out_dir ./outputs/csfleurs
+        --peft_type dora \
+        --reward_type cgpr \
+        --out_dir ./outputs/csfleurs_dora
 
-    # Train on specific language pair
-    python train_csfleurs.py \
+    # Compare with standard LoRA
+    python train_csfleurs_perl.py \
         --config_path configs/zero2.json \
         --model_name_or_path Qwen/Qwen2-Audio-7B-Instruct \
-        --subset xtts_train \
-        --language_pair chinese_english \
-        --out_dir ./outputs/csfleurs_chinese
-
-    # Two-step training (draft + refinement)
-    python train_csfleurs.py \
-        --config_path configs/zero2.json \
-        --model_name_or_path Qwen/Qwen2-Audio-7B-Instruct \
-        --subset xtts_train \
-        --two_step_training \
-        --out_dir ./outputs/csfleurs_twostep
+        --peft_type lora \
+        --reward_type cgpr \
+        --out_dir ./outputs/csfleurs_lora
 """
 
 import logging
+import sys
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 
 import torch
 from transformers import HfArgumentParser
@@ -41,12 +39,48 @@ from transformers import HfArgumentParser
 # Import our custom trainer and dataset
 from trainer.grpo_trainer import GRPOTrainer
 from dataset.csfleurs_dataset import CSFleursDataset, CSFleursDatasetLocal
-from utils.rewards import wer_reward, cer_reward, mixed_wer_cer_reward, cgpr_shaped_reward, cgpr_plus_reward, format_reward
+from utils.rewards import wer_reward, cer_reward, mixed_wer_cer_reward, cgpr_shaped_reward, format_reward
+
+# Using HuggingFace PEFT (DeepSpeed ZeRO-2 compatible)
 
 
 @dataclass
-class CSFleursTrainingArguments:
-    """Arguments for CS-FLEURS GRPO training."""
+class PeftArguments:
+    """PEFT configuration arguments (PeRL-style)."""
+
+    peft_type: str = field(
+        default="dora",
+        metadata={"help": "PEFT type: lora, dora, adalora, pissa, rslora, lorafa, lora_plus, etc."},
+    )
+    use_peft: bool = field(
+        default=True,
+        metadata={"help": "Whether to use PEFT (parameter-efficient fine-tuning)"},
+    )
+    task_type: str = field(
+        default="CAUSAL_LM",
+        metadata={"help": "PEFT task type"},
+    )
+    lora_r: int = field(
+        default=8,
+        metadata={"help": "LoRA rank"},
+    )
+    lora_alpha: int = field(
+        default=32,
+        metadata={"help": "LoRA alpha scaling factor"},
+    )
+    lora_dropout: float = field(
+        default=0.0,
+        metadata={"help": "LoRA dropout rate"},
+    )
+    target_modules: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated target modules (default: q_proj,v_proj,k_proj,o_proj,up_proj,down_proj)"},
+    )
+
+
+@dataclass
+class CSFleursPerlTrainingArguments:
+    """Arguments for CS-FLEURS GRPO training with PeRL."""
 
     # Model arguments
     model_name_or_path: str = field(
@@ -87,21 +121,17 @@ class CSFleursTrainingArguments:
         default=True,
         metadata={"help": "Use VAD-based chunking for long audio"},
     )
-    seed: int = field(
-        default=42,
-        metadata={"help": "Random seed for training, data subsampling, and dataloader shuffling"},
-    )
 
     # Output arguments
     out_dir: str = field(
-        default="./outputs/csfleurs",
+        default="./outputs/csfleurs_perl",
         metadata={"help": "Output directory for checkpoints"},
     )
 
     # WandB arguments
     use_wandb: bool = field(default=True, metadata={"help": "Whether to use WandB logging"})
     run_name: str = field(
-        default="CSFleurs-GRPO",
+        default="CSFleurs-PeRL-GRPO",
         metadata={"help": "WandB run name"},
     )
 
@@ -113,8 +143,8 @@ class CSFleursTrainingArguments:
 
     # Reward type
     reward_type: str = field(
-        default="wer",
-        metadata={"help": "Reward type: 'wer', 'cer', 'mixed', 'cgpr', or 'cgpr_plus' (with entity preservation + script fidelity rewards)"},
+        default="cgpr",
+        metadata={"help": "Reward type: 'wer', 'cer', 'mixed', or 'cgpr' (confidence-gated process rewards)"},
     )
     wer_weight: float = field(
         default=0.5,
@@ -133,14 +163,6 @@ class CSFleursTrainingArguments:
         default=0.2,
         metadata={"help": "CGPR: penalty coefficient for incorrect entities (default 0.2)"},
     )
-    cgpr_beta_translation: float = field(
-        default=0.1,
-        metadata={"help": "CGPR+: coefficient for entity preservation reward (default 0.1)"},
-    )
-    cgpr_beta_script: float = field(
-        default=0.1,
-        metadata={"help": "CGPR+: coefficient for script fidelity reward (default 0.1)"},
-    )
 
     # Format reward
     use_format_reward: bool = field(
@@ -158,8 +180,6 @@ class CSFleursTrainingArguments:
     temperature: float = field(default=1.0, metadata={"help": "Sampling temperature for generation"})
     max_completion_length: int = field(default=512, metadata={"help": "Maximum completion length"})
     save_steps: int = field(default=100, metadata={"help": "Save checkpoint every N steps"})
-    eval_steps: int = field(default=50, metadata={"help": "Evaluate on validation set every N steps"})
-    max_eval_samples: int = field(default=200, metadata={"help": "Maximum number of validation samples for evaluation"})
 
     # Resume training
     resume_from_checkpoint: Optional[str] = field(
@@ -168,10 +188,43 @@ class CSFleursTrainingArguments:
     )
 
 
+def apply_peft_to_model(model, peft_args: PeftArguments):
+    """Apply PEFT method using HuggingFace PEFT (DeepSpeed ZeRO-2 compatible)."""
+    from peft import LoraConfig, get_peft_model, TaskType
+
+    peft_type = peft_args.peft_type.lower()
+
+    # Parse target modules
+    if peft_args.target_modules is None:
+        target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "up_proj", "down_proj"]
+    else:
+        target_modules = [m.strip() for m in peft_args.target_modules.split(",")]
+
+    # DoRA = LoRA with use_dora=True
+    use_dora = peft_type == "dora"
+
+    logging.info(f"Applying HuggingFace PEFT: {'DoRA' if use_dora else 'LoRA'}")
+    logging.info(f"  rank={peft_args.lora_r}, alpha={peft_args.lora_alpha}, dropout={peft_args.lora_dropout}")
+    logging.info(f"  target_modules={target_modules}")
+
+    lora_config = LoraConfig(
+        r=peft_args.lora_r,
+        lora_alpha=peft_args.lora_alpha,
+        lora_dropout=peft_args.lora_dropout,
+        target_modules=target_modules,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        use_dora=use_dora,
+    )
+
+    model = get_peft_model(model, lora_config)
+    return model
+
+
 def main():
     # Parse arguments
-    parser = HfArgumentParser(CSFleursTrainingArguments)
-    args = parser.parse_args_into_dataclasses()[0]
+    parser = HfArgumentParser((CSFleursPerlTrainingArguments, PeftArguments))
+    args, peft_args = parser.parse_args_into_dataclasses()
 
     # Setup logging
     logging.basicConfig(
@@ -180,9 +233,11 @@ def main():
     )
 
     logging.info("=" * 60)
-    logging.info("CS-FLEURS GRPO Training")
+    logging.info("CS-FLEURS PEFT GRPO Training (LoRA/DoRA)")
     logging.info("=" * 60)
     logging.info(f"Model: {args.model_name_or_path}")
+    logging.info(f"PEFT type: {peft_args.peft_type}")
+    logging.info(f"  rank={peft_args.lora_r}, alpha={peft_args.lora_alpha}")
     logging.info(f"Subset: {args.subset}")
     logging.info(f"Language pair: {args.language_pair or 'all'}")
     logging.info(f"Num examples: {args.num_examples or 'all'}")
@@ -190,6 +245,8 @@ def main():
     logging.info(f"Reward type: {args.reward_type}")
     if args.reward_type == "mixed":
         logging.info(f"  WER weight: {args.wer_weight}, CER weight: {args.cer_weight}")
+    elif args.reward_type == "cgpr":
+        logging.info(f"  CGPR alpha: {args.cgpr_alpha}, beta: {args.cgpr_beta}")
     logging.info(f"Output: {args.out_dir}")
     logging.info("=" * 60)
 
@@ -205,7 +262,6 @@ def main():
             max_audio_duration=args.max_audio_duration,
             max_audio_chunk=args.max_audio_chunk,
             use_vad_chunking=args.use_vad_chunking,
-            data_seed=args.seed,
         )
     else:
         logging.info(f"Loading CS-FLEURS from HuggingFace ({chunking_method} chunking)...")
@@ -222,47 +278,6 @@ def main():
 
     if len(train_dataset) == 0:
         raise ValueError("No training examples loaded! Check subset and language_pair settings.")
-
-    # Split dataset 9:1 for training and validation, stratified by language pair
-    from collections import defaultdict
-    from torch.utils.data import Subset
-    import random as _random
-
-    rng = _random.Random(42)
-
-    # Group indices by language pair
-    lang_to_indices = defaultdict(list)
-    for idx in range(len(train_dataset)):
-        lang = train_dataset.samples[idx].get("language", "unknown")
-        lang_to_indices[lang].append(idx)
-
-    train_indices = []
-    val_indices = []
-    lang_split_info = {}
-
-    for lang in sorted(lang_to_indices.keys()):
-        indices = lang_to_indices[lang]
-        rng.shuffle(indices)
-        n_val = max(1, len(indices) // 10)  # at least 1 val sample per language
-        val_indices.extend(indices[:n_val])
-        train_indices.extend(indices[n_val:])
-        lang_split_info[lang] = {"train": len(indices) - n_val, "val": n_val}
-
-    train_indices.sort()
-    val_indices.sort()
-
-    # Cap validation samples for eval speed (stratified cap across languages)
-    if args.max_eval_samples and len(val_indices) > args.max_eval_samples:
-        rng2 = _random.Random(42)
-        rng2.shuffle(val_indices)
-        val_indices = sorted(val_indices[:args.max_eval_samples])
-
-    train_subset = Subset(train_dataset, train_indices)
-    val_subset = Subset(train_dataset, val_indices)
-
-    logging.info(f"Split: {len(train_subset)} train, {len(val_subset)} validation (stratified by language)")
-    for lang, counts in sorted(lang_split_info.items()):
-        logging.info(f"  {lang}: {counts['train']} train, {counts['val']} val")
 
     # Helper to convert CS-FLEURS language codes (ara-eng, cmn-eng) to normalizer codes (en, zh)
     def _convert_language_codes(language, num_completions):
@@ -309,22 +324,6 @@ def main():
             )
         logging.info(f"Using CGPR (Confidence-Gated Process Rewards) with α={args.cgpr_alpha}, β={args.cgpr_beta}")
         logging.info("  Code-switched English phrases will be treated as entities")
-    elif args.reward_type == "cgpr_plus":
-        def csfleurs_reward(prompts, completions, solution, language=None,
-                            raw_text=None, **kwargs):
-            """CER + switch transition fidelity + script fidelity rewards."""
-            lang_codes = _convert_language_codes(language, len(completions))
-            return cgpr_plus_reward(
-                completions, solution,
-                raw_text=raw_text,
-                language=lang_codes,
-                raw_language=language,
-                beta_switch=args.cgpr_beta_translation,
-                beta_script=args.cgpr_beta_script,
-                **kwargs
-            )
-        logging.info(f"Using CER + switch transition fidelity (β={args.cgpr_beta_translation}) "
-                     f"+ script fidelity (β={args.cgpr_beta_script})")
     elif args.reward_type == "format":
         # Format-only baseline - no ASR reward, just format compliance
         reward_funcs = [format_reward]
@@ -349,8 +348,8 @@ def main():
     from trl import GRPOConfig
 
     training_args = GRPOConfig(
-        seed=args.seed,
-        data_seed=args.seed,
+        seed=42,
+        data_seed=42,
         output_dir=args.out_dir,
         deepspeed=args.config_path,
         max_prompt_length=512,
@@ -358,7 +357,7 @@ def main():
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
-        lr_scheduler_type="constant",
+        lr_scheduler_type="constant",  # Avoid scheduler/optimizer param group mismatch with PEFT
         logging_steps=1,
         bf16=True,
         report_to="wandb" if args.use_wandb else [],
@@ -368,12 +367,24 @@ def main():
         run_name=args.run_name,
         save_steps=args.save_steps,
         save_only_model=False,  # Enables DeepSpeed checkpoint resume
-        eval_strategy="steps",
-        eval_steps=args.eval_steps,
-        per_device_eval_batch_size=1,
         temperature=args.temperature,
         num_generations=args.num_generations,
     )
+
+    # Load model and apply PEFT
+    from transformers import Qwen2AudioForConditionalGeneration
+
+    logging.info(f"Loading model: {args.model_name_or_path}")
+    model = Qwen2AudioForConditionalGeneration.from_pretrained(
+        args.model_name_or_path,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa",  # PyTorch native attention (flash_attn build failed)
+    )
+
+    # Apply HuggingFace PEFT (DoRA/LoRA)
+    if peft_args.use_peft:
+        model = apply_peft_to_model(model, peft_args)
+        model.print_trainable_parameters()
 
     # Callback to skip saving until step > 40
     from transformers import TrainerCallback
@@ -384,13 +395,13 @@ def main():
                 control.should_save = False
             return control
 
-    # Create trainer
+    # Create trainer - DeepSpeed manages the optimizer
     trainer = GRPOTrainer(
-        model=args.model_name_or_path,
+        model=model,
         reward_funcs=reward_funcs,
         args=training_args,
-        train_dataset=train_subset,
-        eval_dataset=val_subset,
+        train_dataset=train_dataset,
+        eval_dataset=None,
         two_step_training=args.two_step_training,
         callbacks=[SkipEarlySaveCallback()],
     )

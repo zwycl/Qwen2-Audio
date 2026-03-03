@@ -3,6 +3,9 @@
 </p>
 <br><br>
 
+
+torchrun --nproc_per_node=8 src/train_afrispeech_asr.py       --config_path configs/zero2.json       --model_name_or_path Qwen/Qwen2-Audio-7B-Instruct       --data_dir ../afrispeech_data       --out_dir ../outputs/afrispeech_asr
+
 <p align="center">
     <img src="https://qianwen-res.oss-cn-beijing.aliyuncs.com/assets/blog/qwenaudio/qwen2audio_logo.png" width="400"/>
 <p>
